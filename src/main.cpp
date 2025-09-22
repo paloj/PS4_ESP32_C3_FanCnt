@@ -3,18 +3,18 @@
 #include <Preferences.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <driver/adc.h>   // for analogSetPinAttenuation constants
+#include <driver/adc.h>   // for analogSetPinAttenuation
 
 // -------- PINS / PWM ----------
 #define PWM_FREQ_HZ      31250
-#define PWM_RES_BITS     10
+#define PWM_RES_BITS     10        // C3: 10-bit at 31.25 kHz works (12-bit would fail)
 #define PWM_CH_A         0
 #define PWM_CH_B         1
-#define PIN_PWM_A        2     // floor (10k -> fan node) - Available on most SuperMini
-#define PIN_PWM_B        10    // lift  (5.1k -> fan node) - Available on most SuperMini
-#define PIN_PS4_IN       4     // ADC: PS4 control (direct wire)
-#define PIN_DS18B20      5     // 1-Wire bus (all DS18B20 sensors)
-#define PIN_FAN_FB       3     // ADC: fan node feedback via 100k + 10nF to GND (MCU side)
+#define PIN_PWM_A        2         // floor (10k -> fan node)
+#define PIN_PWM_B        10        // lift  (5.1k -> fan node)
+#define PIN_PS4_IN       4         // ADC: PS4 control (direct wire)
+#define PIN_DS18B20      5         // 1-Wire bus (all DS18B20 sensors)
+#define PIN_FAN_FB       3         // ADC: fan node feedback via 100k + 10nF to GND (MCU side)
 
 // Wi-Fi AP
 const char* ssid = "PS4FAN-CTRL";
@@ -26,21 +26,24 @@ Preferences prefs;
 OneWire oneWire(PIN_DS18B20);
 DallasTemperature sensors(&oneWire);
 
-// -------- DEFAULTS (for reset buttons) ----------
+// -------- DEFAULTS ----------
 struct Defaults {
-  float vin_min_v   = 0.655f;
-  float vin_max_v   = 0.815f;
+  float vin_min_v   = 0.600f;  // PS4 signal low end
+  float vin_max_v   = 1.000f;  // PS4 signal high end
   float floor_pct   = 32.1f;   // baseline % on PWM_A
   float lift_span   = 20.0f;   // range % on PWM_B
   float fan_max     = 100.0f;  // cap for PWM_B
   float attack_ms   = 200.0f;  // ms per 1% delta
   float temp_fail   = 80.0f;   // °C → full fan failsafe
-  bool  use_temp_mode = false; // false=PS4, true=Temp curve
+  bool  use_temp_mode = true;  // Start in temp mode since that's primary use
   float temp_pt[5] = {30, 35, 40, 45, 55};
   float fan_pt[5]  = {10, 15, 20, 30, 100};
+  // ADC calibration defaults (centered in slider ranges)
+  float cal_vin_gain  = 1.000f, cal_vin_off  = 0.000f;   // gain: 0.8-1.2, off: -0.5 to +0.5
+  float cal_vfan_gain = 1.000f, cal_vfan_off = 0.000f;
 } D;
 
-// -------- PARAMETERS (tunable, persisted) ----------
+// -------- PARAMETERS (persisted) ----------
 float vin_min_v   = D.vin_min_v;
 float vin_max_v   = D.vin_max_v;
 float floor_pct   = D.floor_pct;
@@ -52,6 +55,10 @@ bool  use_temp_mode = D.use_temp_mode;
 
 float temp_pt[5] = {D.temp_pt[0],D.temp_pt[1],D.temp_pt[2],D.temp_pt[3],D.temp_pt[4]};
 float fan_pt [5] = {D.fan_pt [0],D.fan_pt [1],D.fan_pt [2],D.fan_pt [3],D.fan_pt [4]};
+
+// ADC calibration (UI sliders)
+float cal_vin_gain  = D.cal_vin_gain,  cal_vin_off  = D.cal_vin_off;
+float cal_vfan_gain = D.cal_vfan_gain, cal_vfan_off = D.cal_vfan_off;
 
 // -------- LIVE VARS ----------
 float vin_now=0, vfan_model=0, vfan_meas=0, dutyB_now=0;
@@ -73,6 +80,7 @@ uint32_t toDutyCounts(float dutyPct){
   return (uint32_t)roundf(dutyPct*((1<<PWM_RES_BITS)-1)/100.0f);
 }
 float clamp01(float x){ return x<0?0:(x>1?1:x); }
+static bool tempValid(float t){ return (t > -40 && t < 125); }
 
 float interpCurve(float t){
   if (t<=temp_pt[0]) return fan_pt[0];
@@ -85,9 +93,12 @@ float interpCurve(float t){
   return fan_pt[4];
 }
 
-static bool tempValid(float t){
-  return (t > -40 && t < 125);              // reject -127, 85 stuck, etc.
-}
+auto sane = [](float v,float lo,float hi,float d)->float{
+  if (isnan(v)) return d;           // only default if NaN
+  if (v<lo) return lo;
+  if (v>hi) return hi;
+  return v;
+};
 
 // -------- CONTROL LOOP ----------
 void updateControl(){
@@ -99,41 +110,25 @@ void updateControl(){
 
   float best = NAN, other = NAN;
   if (ds_count >= 1){
-    // Read up to first two sensors (we only care about the hottest)
     float t0 = sensors.getTempCByIndex(0);
     float t1 = (ds_count >= 2) ? sensors.getTempCByIndex(1) : NAN;
-
-    bool v0 = tempValid(t0);
-    bool v1 = tempValid(t1);
-
-    if (v0 && v1){
-      if (t0 >= t1){ best=t0; other=t1; } else { best=t1; other=t0; }
-    } else if (v0){
-      best=t0; other=NAN;
-    } else if (v1){
-      best=t1; other=NAN;
-    } else {
-      best=NAN; other=NAN;
-    }
+    bool v0 = tempValid(t0), v1 = tempValid(t1);
+    if (v0 && v1){ if (t0 >= t1){ best=t0; other=t1; } else { best=t1; other=t0; } }
+    else if (v0){ best=t0; }
+    else if (v1){ best=t1; }
   }
   temp_hot   = best;
   temp_other = other;
-
-  if (!tempValid(temp_hot)) {
-    // invalid primary temp reading
-    fan_fail = true;
-  }
+  if (!tempValid(temp_hot)) fan_fail = true;
 
   // --- Decide target based on mode ---
   float dutyB_tgt = 0;
 
   if (!use_temp_mode && !fan_fail){
-    // PS4 mode: read Vin (25 kHz PWM averaged in SW)
-    uint32_t acc=0; const int N=32;
-    for (int i=0;i<N;i++){ acc += analogRead(PIN_PS4_IN); delayMicroseconds(200); }
-    float adc  = acc / (float)N;
-    float vin  = (adc/4095.0f)*3.3f;
-    vin_now    = vin;
+    // PS4 mode: read Vin using factory-calibrated conversion
+    int mv_in = analogReadMilliVolts(PIN_PS4_IN);    // 0..3300 mV (ADC_11db)
+    float vin = (mv_in/1000.0f) * cal_vin_gain + cal_vin_off;
+    vin_now   = vin;
 
     if (vin < 0.05 || vin > 3.30) fan_fail = true;
 
@@ -168,12 +163,10 @@ void updateControl(){
   float VB=3.3f*(dutyB/100.0f);
   vfan_model = (VA/10000.0f + VB/5100.0f) / (1/10000.0f + 1/5100.0f);
 
-  // Measure fan node via GPIO3 feedback
+  // Measure fan node via GPIO3 feedback (factory-calibrated path then trimmed)
   {
-    uint32_t acc=0; const int N=16;
-    for (int i=0;i<N;i++){ acc += analogRead(PIN_FAN_FB); delayMicroseconds(150); }
-    float adc = acc / (float)N;
-    vfan_meas = (adc/4095.0f)*3.3f;
+    int mv_fb = analogReadMilliVolts(PIN_FAN_FB);
+    vfan_meas = (mv_fb/1000.0f) * cal_vfan_gain + cal_vfan_off;
   }
 
   // Log every second
@@ -208,29 +201,41 @@ String htmlPage(){
   h+="Fail=<span id='fail'>?</span></p>";
 
   auto slider=[&](String name,float val,float min,float max,float step){
-    h+="<p>"+name+": <input type='range' min='"+String(min)+"' max='"+String(max)+"' step='"+String(step)+"' value='"+String(val)+"' class='slider' id='"+name+"'> ";
+    h+="<p onmousedown='freeze(1)' ontouchstart='freeze(1)' onmouseup='freeze(0)' ontouchend='freeze(0)'>";
+    h+=name+": <input type='range' min='"+String(min)+"' max='"+String(max)+"' step='"+String(step)+"' value='"+String(val)+"' class='slider' id='"+name+"'> ";
     h+="<span id='"+name+"val'>"+String(val,3)+"</span>";
     h+=" <button class='small' onclick=\"resetOne('"+name+"')\">↺</button></p>";
   };
 
-  slider("vin_min_v", vin_min_v, 0.4, 1.2, 0.001);
-  slider("vin_max_v", vin_max_v, 0.6, 1.2, 0.001);
+  // PS4 input mapping (actual PS4 signal range is ~0.6-1.0V, fan optimal is ~1.03-1.18V)
+  slider("vin_min_v", vin_min_v, 0.50, 1.00, 0.001);
+  slider("vin_max_v", vin_max_v, 0.70, 1.20, 0.001);
+  // Output shaping
   slider("floor_pct", floor_pct, 20, 40, 0.1);
   slider("lift_span", lift_span, 0, 50, 0.1);
-  slider("fan_max", fan_max, 20, 100, 0.1);
+  slider("fan_max",   fan_max,   20, 100, 0.1);
   slider("attack_ms", attack_ms, 50, 2000, 10);
   slider("temp_fail", temp_fail, 50, 100, 1);
 
+  // ADC calibration (wide range, defaults centered)
+  h+="<h3>Calibration</h3>";
+  slider("cal_vin_off",   cal_vin_off,  -0.50, 0.50, 0.001);
+  slider("cal_vin_gain",  cal_vin_gain,  0.80, 1.20, 0.001);
+  slider("cal_vfan_off",  cal_vfan_off, -0.50, 0.50, 0.001);
+  slider("cal_vfan_gain", cal_vfan_gain, 0.80, 1.20, 0.001);
+
   h+="<h3>Temp Curve (°C → %)</h3>";
   for(int i=0;i<5;i++){
-    h+="<p>T"+String(i+1)+" <input type='number' id='t"+i+"' value='"+String(temp_pt[i],1)+"' step='0.5' style='width:70px'> → ";
+    h+="<p onmousedown='freeze(1)' ontouchstart='freeze(1)' onmouseup='freeze(0)' ontouchend='freeze(0)'>";
+    h+="T"+String(i+1)+" <input type='number' id='t"+i+"' value='"+String(temp_pt[i],1)+"' step='0.5' style='width:70px'> → ";
     h+="<input type='number' id='f"+String(i)+"' value='"+String(fan_pt[i],1)+"' step='1' style='width:70px'> %";
     h+=" <button class='small' onclick='resetRow("+String(i)+")'>↺</button></p>";
   }
 
   h+="<p>Mode: <button onclick='toggleMode()'>Toggle PS4/Temp</button> ";
   h+="<button onclick='save()'>Save</button> ";
-  h+="<button onclick='resetAll()'>Reset ALL to defaults</button></p>";
+  h+="<button onclick='resetAll()'>Reset ALL to defaults</button> ";
+  h+="<button onclick='factory()'>Factory wipe (NVS) & reboot</button></p>";
 
   h+="<div id='charts'><canvas id='cTemp'></canvas><canvas id='cFan'></canvas><canvas id='cVfan'></canvas></div>";
   h+="<p><a href='/history' target='_blank'>Open history JSON</a></p>";
@@ -238,8 +243,9 @@ String htmlPage(){
   h+="<script>";
   h+="function $(id){return document.getElementById(id)};";
   h+="let DEF={}; fetch('/defaults').then(r=>r.json()).then(j=>{DEF=j;});";
+  h+="let FREEZE=0; function freeze(x){FREEZE=x;}";
 
-  h+="function refresh(){fetch('/json').then(r=>r.json()).then(j=>{";
+  h+="function refresh(){ if(FREEZE) return; fetch('/json').then(r=>r.json()).then(j=>{";
   h+="$('vin').innerText=j.vin.toFixed(3);";
   h+="$('vfan').innerText=j.vfan.toFixed(3);";
   h+="$('vfanm').innerText=j.vfanm.toFixed(3);";
@@ -249,24 +255,42 @@ String htmlPage(){
   h+="$('dscount').innerText=j.dscount;";
   h+="$('mode').innerText=j.mode?'Temp':'PS4';";
   h+="$('fail').innerText=j.fail?'YES':'no';";
+  // initial fill of sliders from current config (once)
   h+="if(j.config && !window.configLoaded){";
-  h+="Object.keys(j.config).forEach(k=>{if($(k)){$(k).value=j.config[k];var v=$(k+'val');if(v)v.innerText=j.config[k];}});";
-  h+="window.configLoaded=true;}";
+  h+="Object.keys(j.config).forEach(k=>{if($(k)){ $(k).value=j.config[k]; var v=$(k+'val'); if(v) v.innerText=j.config[k]; }});";
+  h+="window.configLoaded=true; linkVinSliders(); }";
   h+="}).catch(()=>{});}";             // ignore transient parse errors
-  h+="setInterval(refresh,1000);";
+  h+="setInterval(refresh,1000); refresh();";
 
+  // Save
   h+="function save(){var q='';";
-  h+="['vin_min_v','vin_max_v','lift_span','floor_pct','fan_max','attack_ms','temp_fail'].forEach(function(k){q+=k+'='+$(k).value+'&';});";
+  h+="['vin_min_v','vin_max_v','lift_span','floor_pct','fan_max','attack_ms','temp_fail','cal_vin_off','cal_vin_gain','cal_vfan_off','cal_vfan_gain']";
+  h+=".forEach(function(k){q+=k+'='+$(k).value+'&';});";
   h+="for(var i=0;i<5;i++){q+='t'+i+'='+$('t'+i).value+'&f'+i+'='+$('f'+i).value+'&';}";
   h+="fetch('/set?'+q).then(()=>alert('Saved'));}";
+
+  // Toggle mode
   h+="function toggleMode(){fetch('/toggle');}";
-  h+="['vin_min_v','vin_max_v','lift_span','floor_pct','fan_max','attack_ms','temp_fail'].forEach(function(k){var e=$(k);var o=$(k+'val');e.oninput=function(){o.innerText=this.value;};});";
 
-  h+="function resetOne(k){ if(!DEF.defaults) return; const v=DEF.defaults[k]; if(v===undefined) return; $(k).value=v; $(k+'val').innerText=v; }";
+  // Live value mirrors
+  h+="['vin_min_v','vin_max_v','lift_span','floor_pct','fan_max','attack_ms','temp_fail','cal_vin_off','cal_vin_gain','cal_vfan_off','cal_vfan_gain']";
+  h+=".forEach(function(k){var e=$(k);var o=$(k+'val');e.oninput=function(){o.innerText=this.value;};});";
+
+  // Interlock vin sliders (mutual constraints, keeps a ≥10 mV gap)
+  h+="function linkVinSliders(){ const min=$('vin_min_v'), max=$('vin_max_v'); function clamp(){";
+  h+=" let vmin=parseFloat(min.value)||0.655; let vmax=parseFloat(max.value)||0.815;";
+  h+=" if(vmax <= vmin + 0.010){ vmax = (vmin + 0.020); max.value=vmax.toFixed(3); $('vin_max_vval').innerText=max.value; }";
+  h+=" max.min=(vmin+0.010).toFixed(3); min.max=(vmax-0.010).toFixed(3); }";
+  h+=" min.oninput=function(){ $('vin_min_vval').innerText=this.value; clamp(); };";
+  h+=" max.oninput=function(){ $('vin_max_vval').innerText=this.value; clamp(); }; clamp(); }";
+
+  // Reset helpers
+  h+="function resetOne(k){ if(!DEF.defaults) return; const v=DEF.defaults[k]; if(v===undefined) return; $(k).value=v; $(k+'val').innerText=v; if(k==='vin_min_v'||k==='vin_max_v') linkVinSliders(); }";
   h+="function resetRow(i){ if(!DEF.defaults) return; $('t'+i).value=DEF.defaults['t'+i]; $('f'+i).value=DEF.defaults['f'+i]; }";
-  h+="function resetAll(){ if(!DEF.defaults) return; Object.keys(DEF.defaults).forEach(k=>{ if($(k)){ $(k).value=DEF.defaults[k]; var v=$(k+'val'); if(v) v.innerText=DEF.defaults[k]; }}); save(); }";
+  h+="function resetAll(){ if(!DEF.defaults) return; Object.keys(DEF.defaults).forEach(k=>{ if($(k)){ $(k).value=DEF.defaults[k]; var v=$(k+'val'); if(v) v.innerText=DEF.defaults[k]; }}); linkVinSliders(); save(); }";
+  h+="function factory(){ fetch('/factory').then(()=>{setTimeout(()=>location.reload(),500);}); }";
 
-  // tiny charts
+  // Charts
   h+="function drawChart(c,xs,ys,col,yMin,yMax,yl){const ctx=c.getContext('2d');const W=c.width=c.clientWidth,H=c.height=c.clientHeight;ctx.clearRect(0,0,W,H);ctx.fillStyle='#fff';ctx.fillRect(0,0,W,H);const L=40,R=10,T=10,B=20,w=W-L-R,h=H-T-B;ctx.strokeStyle='#ddd';ctx.beginPath();for(let g=0;g<=4;g++){let y=T+h*g/4;ctx.moveTo(L,y);ctx.lineTo(W-R,y);}ctx.stroke();ctx.strokeStyle='#000';ctx.beginPath();ctx.moveTo(L,T);ctx.lineTo(L,H-B);ctx.lineTo(W-R,H-B);ctx.stroke();ctx.fillStyle='#000';ctx.font='12px sans-serif';ctx.fillText(yl,5,12);if(xs.length<2)return;const x0=xs[0],x1=xs[xs.length-1];const X=x=>L+(x-x0)/(x1-x0||1)*w;const Y=y=>T+(1-(y-yMin)/(yMax-yMin||1))*h;ctx.strokeStyle=col;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(X(xs[0]),Y(ys[0]));for(let i=1;i<xs.length;i++)ctx.lineTo(X(xs[i]),Y(ys[i]));ctx.stroke();}";
   h+="function renderCharts(){fetch('/history').then(r=>r.json()).then(a=>{if(a.length<2)return;const xs=a.map(s=>s.t),temps=a.map(s=>s.thot),fans=a.map(s=>s.duty),vfm=a.map(s=>s.vfanm);const tmin=Math.min(...temps,30),tmax=Math.max(...temps,90);drawChart(document.getElementById('cTemp'),xs,temps,'#c00',tmin,tmax,'°C');drawChart(document.getElementById('cFan'),xs,fans,'#06c',0,100,'%');const vmin=Math.min(...vfm,0.8),vmax=Math.max(...vfm,1.3);drawChart(document.getElementById('cVfan'),xs,vfm,'#090',vmin,vmax,'Vfan(meas)');}).catch(()=>{});}";  
   h+="setInterval(renderCharts,2000); renderCharts();";
@@ -276,6 +300,7 @@ String htmlPage(){
   return h;
 }
 
+// -------- HANDLERS ----------
 void handleRoot(){ server.send(200,"text/html",htmlPage()); }
 
 void handleDefaults(){
@@ -286,7 +311,11 @@ void handleDefaults(){
   j+="\"lift_span\":"+String(D.lift_span,1)+",";
   j+="\"fan_max\":"+String(D.fan_max,1)+",";
   j+="\"attack_ms\":"+String(D.attack_ms,1)+",";
-  j+="\"temp_fail\":"+String(D.temp_fail,1);
+  j+="\"temp_fail\":"+String(D.temp_fail,1)+",";
+  j+="\"cal_vin_off\":"+String(D.cal_vin_off,3)+",";
+  j+="\"cal_vin_gain\":"+String(D.cal_vin_gain,3)+",";
+  j+="\"cal_vfan_off\":"+String(D.cal_vfan_off,3)+",";
+  j+="\"cal_vfan_gain\":"+String(D.cal_vfan_gain,3);
   for(int i=0;i<5;i++){
     j+=",\"t"+String(i)+"\":"+String(D.temp_pt[i],1);
     j+=",\"f"+String(i)+"\":"+String(D.fan_pt[i],1);
@@ -296,6 +325,7 @@ void handleDefaults(){
 }
 
 void handleSet(){
+  // read args
   if(server.hasArg("vin_min_v"))vin_min_v=server.arg("vin_min_v").toFloat();
   if(server.hasArg("vin_max_v"))vin_max_v=server.arg("vin_max_v").toFloat();
   if(server.hasArg("floor_pct"))floor_pct=server.arg("floor_pct").toFloat();
@@ -303,10 +333,39 @@ void handleSet(){
   if(server.hasArg("fan_max"))fan_max=server.arg("fan_max").toFloat();
   if(server.hasArg("attack_ms"))attack_ms=server.arg("attack_ms").toFloat();
   if(server.hasArg("temp_fail"))temp_fail=server.arg("temp_fail").toFloat();
+  if(server.hasArg("cal_vin_off"))  cal_vin_off = server.arg("cal_vin_off").toFloat();
+  if(server.hasArg("cal_vin_gain")) cal_vin_gain= server.arg("cal_vin_gain").toFloat();
+  if(server.hasArg("cal_vfan_off")) cal_vfan_off= server.arg("cal_vfan_off").toFloat();
+  if(server.hasArg("cal_vfan_gain"))cal_vfan_gain=server.arg("cal_vfan_gain").toFloat();
   for(int i=0;i<5;i++){
-    if(server.hasArg("t"+String(i)))temp_pt[i]=server.arg("t"+String(i)).toFloat();
-    if(server.hasArg("f"+String(i)))fan_pt[i]=server.arg("f"+String(i)).toFloat();
+    if(server.hasArg("t"+String(i)))temp_pt[i]=server.arg("t"+i).toFloat();
+    if(server.hasArg("f"+String(i)))fan_pt[i]=server.arg("f"+i).toFloat();
   }
+
+  // sanitize and enforce range/gap
+  vin_min_v = sane(vin_min_v, 0.50f, 1.00f, D.vin_min_v);
+  vin_max_v = sane(vin_max_v, 0.70f, 1.20f, D.vin_max_v);
+  // Ensure proper ordering with minimum gap
+  if (vin_max_v <= vin_min_v) { 
+    vin_max_v = vin_min_v + 0.05f;
+    if (vin_max_v > 1.20f) {
+      vin_max_v = 1.20f;
+      vin_min_v = vin_max_v - 0.05f;
+    }
+  }
+
+  floor_pct = sane(floor_pct, 10.0f, 60.0f, D.floor_pct);
+  lift_span = sane(lift_span, 0.0f,  60.0f, D.lift_span);
+  fan_max   = sane(fan_max,   10.0f, 100.0f, D.fan_max);
+  attack_ms = sane(attack_ms, 20.0f, 4000.0f, D.attack_ms);
+  temp_fail = sane(temp_fail, 50.0f, 100.0f, D.temp_fail);
+
+  cal_vin_gain  = sane(cal_vin_gain,  0.80f, 1.20f, D.cal_vin_gain);
+  cal_vfan_gain = sane(cal_vfan_gain, 0.80f, 1.20f, D.cal_vfan_gain);
+  cal_vin_off   = sane(cal_vin_off,  -0.50f, 0.50f, D.cal_vin_off);
+  cal_vfan_off  = sane(cal_vfan_off, -0.50f, 0.50f, D.cal_vfan_off);
+
+  // persist
   prefs.begin("fan",false);
   prefs.putFloat("vin_min_v",vin_min_v);
   prefs.putFloat("vin_max_v",vin_max_v);
@@ -315,12 +374,17 @@ void handleSet(){
   prefs.putFloat("fan_max",fan_max);
   prefs.putFloat("attack_ms",attack_ms);
   prefs.putFloat("temp_fail",temp_fail);
+  prefs.putFloat("cal_vin_off",  cal_vin_off);
+  prefs.putFloat("cal_vin_gain", cal_vin_gain);
+  prefs.putFloat("cal_vfan_off", cal_vfan_off);
+  prefs.putFloat("cal_vfan_gain",cal_vfan_gain);
   for(int i=0;i<5;i++){
     prefs.putFloat(("t"+String(i)).c_str(),temp_pt[i]);
     prefs.putFloat(("f"+String(i)).c_str(),fan_pt[i]);
   }
   prefs.putBool("mode",use_temp_mode);
   prefs.end();
+
   server.send(200,"text/plain","OK");
 }
 
@@ -330,13 +394,12 @@ void handleJson(){
   j+="\"vfan\":"+String(vfan_model,3)+",";
   j+="\"vfanm\":"+String(vfan_meas,3)+",";
   j+="\"dutyB\":"+String(dutyB_now,1)+",";
-  // temps: hottest as temp0, other as temp1 (use null if missing)
-  if (tempValid(temp_hot))  j+="\"temp0\":"+String(temp_hot,1)+","; else j+="\"temp0\":null,";
-  if (tempValid(temp_other))j+="\"temp1\":"+String(temp_other,1)+","; else j+="\"temp1\":null,";
+  if (tempValid(temp_hot))   j+="\"temp0\":"+String(temp_hot,1)+","; else j+="\"temp0\":null,";
+  if (tempValid(temp_other)) j+="\"temp1\":"+String(temp_other,1)+","; else j+="\"temp1\":null,";
   j+="\"dscount\":"+String(ds_count)+",";
   j+="\"mode\":" + String(use_temp_mode ? "true" : "false") + ",";
   j+="\"fail\":" + String(fan_fail ? "true" : "false") + ",";
-  // Add current configuration values
+  // current config for first-time UI fill
   j+="\"config\":{";
   j+="\"vin_min_v\":"+String(vin_min_v,3)+",";
   j+="\"vin_max_v\":"+String(vin_max_v,3)+",";
@@ -344,13 +407,16 @@ void handleJson(){
   j+="\"lift_span\":"+String(lift_span,1)+",";
   j+="\"fan_max\":"+String(fan_max,1)+",";
   j+="\"attack_ms\":"+String(attack_ms,1)+",";
-  j+="\"temp_fail\":"+String(temp_fail,1);
+  j+="\"temp_fail\":"+String(temp_fail,1)+",";
+  j+="\"cal_vin_off\":"+String(cal_vin_off,3)+",";
+  j+="\"cal_vin_gain\":"+String(cal_vin_gain,3)+",";
+  j+="\"cal_vfan_off\":"+String(cal_vfan_off,3)+",";
+  j+="\"cal_vfan_gain\":"+String(cal_vfan_gain,3);
   for(int i=0;i<5;i++){
     j+=",\"t"+String(i)+"\":"+String(temp_pt[i],1);
     j+=",\"f"+String(i)+"\":"+String(fan_pt[i],1);
   }
-  j+="}";
-  j+="}";
+  j+="}}";
   server.send(200,"application/json",j);
 }
 
@@ -375,32 +441,35 @@ void handleToggle(){
   server.send(200,"text/plain",use_temp_mode?"Temp mode":"PS4 mode");
 }
 
+void handleFactory(){
+  prefs.begin("fan", false);
+  prefs.clear();       // wipe this namespace
+  prefs.end();
+  server.send(200,"text/plain","Cleared. Rebooting…");
+  delay(200);
+  ESP.restart();
+}
+
 // -------- SETUP / LOOP ----------
 unsigned long lastUpdate=0;
 
 void setup(){
+  Serial.begin(115200);
+
   analogReadResolution(12);
-  analogSetPinAttenuation(PIN_PS4_IN, ADC_11db);  // 0..3.3 V
+  analogSetPinAttenuation(PIN_PS4_IN, ADC_11db);  // 0..~3.3 V
   analogSetPinAttenuation(PIN_FAN_FB, ADC_11db);
 
-  // Setup PWM with explicit debugging
-  Serial.begin(115200);
-  Serial.println("Setting up PWM...");
-  
-  bool success_A = ledcSetup(PWM_CH_A, PWM_FREQ_HZ, PWM_RES_BITS);
-  bool success_B = ledcSetup(PWM_CH_B, PWM_FREQ_HZ, PWM_RES_BITS);
-  Serial.printf("PWM setup - Channel A: %s, Channel B: %s\n", success_A?"OK":"FAIL", success_B?"OK":"FAIL");
-  
+  // PWM
+  float fA = ledcSetup(PWM_CH_A, PWM_FREQ_HZ, PWM_RES_BITS);
+  float fB = ledcSetup(PWM_CH_B, PWM_FREQ_HZ, PWM_RES_BITS);
   ledcAttachPin(PIN_PWM_A, PWM_CH_A);
   ledcAttachPin(PIN_PWM_B, PWM_CH_B);
-  Serial.printf("PWM attached to pins %d and %d\n", PIN_PWM_A, PIN_PWM_B);
+  Serial.printf("LEDC timers: A=%.1f Hz, B=%.1f Hz (res=%d bits)\n", fA, fB, PWM_RES_BITS);
 
-  // Apply safe baseline immediately (prevents 0% at boot)
-  uint32_t duty_A = toDutyCounts(floor_pct);
-  uint32_t duty_B = toDutyCounts(100);
-  ledcWrite(PWM_CH_A, duty_A);
-  ledcWrite(PWM_CH_B, duty_B);
-  Serial.printf("PWM duty cycles set - A: %u (%.1f%%), B: %u (100%%)\n", duty_A, floor_pct, duty_B);
+  // Safe baseline immediately (prevents 0% at boot)
+  ledcWrite(PWM_CH_A, toDutyCounts(floor_pct));
+  ledcWrite(PWM_CH_B, toDutyCounts(100));     // full lift until control loop runs once
 
   sensors.begin();
 
@@ -414,11 +483,20 @@ void setup(){
   attack_ms=prefs.getFloat("attack_ms",attack_ms);
   temp_fail=prefs.getFloat("temp_fail",temp_fail);
   use_temp_mode=prefs.getBool("mode",use_temp_mode);
+  cal_vin_off  = prefs.getFloat("cal_vin_off",  cal_vin_off);
+  cal_vin_gain = prefs.getFloat("cal_vin_gain", cal_vin_gain);
+  cal_vfan_off = prefs.getFloat("cal_vfan_off", cal_vfan_off);
+  cal_vfan_gain= prefs.getFloat("cal_vfan_gain",cal_vfan_gain);
   for(int i=0;i<5;i++){
     temp_pt[i]=prefs.getFloat(("t"+String(i)).c_str(),temp_pt[i]);
     fan_pt[i]=prefs.getFloat(("f"+String(i)).c_str(),fan_pt[i]);
   }
   prefs.end();
+
+  // Sanitize & enforce small gap without hard reset
+  vin_min_v = sane(vin_min_v, 0.40f, 1.20f, D.vin_min_v);
+  vin_max_v = sane(vin_max_v, 0.40f, 1.20f, D.vin_max_v);
+  if (vin_max_v <= vin_min_v + 0.01f) { vin_max_v = vin_min_v + 0.02f; }
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(ssid,password);
@@ -429,6 +507,7 @@ void setup(){
   server.on("/history",handleHistory);
   server.on("/toggle",handleToggle);
   server.on("/defaults",handleDefaults);
+  server.on("/factory",handleFactory);
   server.begin();
 }
 
