@@ -37,6 +37,9 @@ struct Defaults {
   bool  use_temp_mode = true;  // Start in temp mode since that's primary use
   float temp_pt[5] = {30, 35, 40, 45, 55};
   float fan_pt[5]  = {10, 15, 20, 30, 100};
+  // Desired fan node voltage window (based on feedback) for full operating range
+  float node_v_min = 1.03f;    // fan just starts reliably
+  float node_v_max = 1.18f;    // full speed target ceiling
   // ADC calibration defaults (centered in slider ranges)
   float cal_vin_gain  = 1.000f, cal_vin_off  = 0.000f;   // gain: 0.8-1.2, off: -0.5 to +0.5
   float cal_vfan_gain = 1.000f, cal_vfan_off = 0.000f;
@@ -55,6 +58,10 @@ bool  use_temp_mode = D.use_temp_mode;
 float temp_pt[5] = {D.temp_pt[0],D.temp_pt[1],D.temp_pt[2],D.temp_pt[3],D.temp_pt[4]};
 float fan_pt [5] = {D.fan_pt [0],D.fan_pt [1],D.fan_pt [2],D.fan_pt [3],D.fan_pt [4]};
 
+// Fan node voltage window
+float node_v_min = D.node_v_min;
+float node_v_max = D.node_v_max;
+
 // ADC calibration (UI sliders)
 float cal_vin_gain  = D.cal_vin_gain,  cal_vin_off  = D.cal_vin_off;
 float cal_vfan_gain = D.cal_vfan_gain, cal_vfan_off = D.cal_vfan_off;
@@ -66,6 +73,26 @@ float temp_hot=0;       // hottest DS18B20 (used for control)
 float temp_other=NAN;   // the other (display only)
 int   ds_count=0;
 bool  fan_fail=false;
+
+// -------- WINDOW NORMALIZATION DIAGNOSTICS ----------
+// Physical (actual PWM_B duty %) range that corresponds to logical 0..100 span
+float dutyB_min_phys = 0.0f;
+float dutyB_max_phys = 100.0f;
+// Compression / validity flags
+bool win_comp_low=false;   // floor alone already >= node_v_min
+bool win_comp_high=false;  // cannot reach node_v_max (VB would exceed 3.3V)
+bool win_invalid=false;    // floor pushes node above node_v_max (window inverted)
+bool floor_auto_event=false; // set true when floor auto-raised this session (sticky until next /set)
+
+// Persistence debounce for auto floor adjustments
+static unsigned long lastFloorPersist=0;
+static bool floor_dirty=false;
+
+// Resistor weighting constants (10k on channel A, 5.1k on channel B)
+constexpr float R_A = 10000.0f;
+constexpr float R_B = 5100.0f;
+constexpr float W_A = (1.0f/R_A)/((1.0f/R_A)+(1.0f/R_B));
+constexpr float W_B = 1.0f - W_A; // should be ~0.6623
 
 // -------- HISTORY ----------
 struct Sample { unsigned long t; float thot, toth, vin, vfan_mod, vfan_mea, duty; };
@@ -122,7 +149,8 @@ void updateControl(){
   if (!tempValid(temp_hot)) fan_fail = true;
 
   // --- Decide target based on mode ---
-  float dutyB_tgt = 0;
+  // Logical lift target (0-100) before voltage window normalization
+  float lift_logical = 0;
 
   if (!use_temp_mode && !fan_fail){
     // PS4 mode: read Vin using factory-calibrated conversion
@@ -133,25 +161,64 @@ void updateControl(){
     if (vin < 0.05 || vin > 3.30) fan_fail = true;
 
     float norm = clamp01((vin - vin_min_v) / (vin_max_v - vin_min_v));
-    dutyB_tgt  = lift_span * norm;
-    if (dutyB_tgt > fan_max) dutyB_tgt = fan_max;
+    lift_logical  = lift_span * norm;
+    if (lift_logical > fan_max) lift_logical = fan_max; // fan_max acts as logical cap pre-normalization
   }
   else if (!fan_fail){
     // Temp mode: use hottest sensor
-    dutyB_tgt = interpCurve(temp_hot);
+    lift_logical = interpCurve(temp_hot); // Curve already 0-100 logical
   }
 
   // Failsafe: over temperature → full fan
   if (tempValid(temp_hot) && temp_hot >= temp_fail) fan_fail = true;
-  if (fan_fail) dutyB_tgt = 100.0f;
+  if (fan_fail) lift_logical = 100.0f;
 
-  // Slew limit (50 ms loop)
+  // --- Map logical lift (0..100) into physical PWM_B duty range that produces node_v_min..node_v_max ---
+  // Compute current VA from floor
+  float VA = 3.3f*(floor_pct/100.0f);
+
+  // Desired node voltage window endpoints relative to current floor
+  // Solve VB for each endpoint: VB = (Vnode - W_A*VA)/W_B
+  float VB_min = (node_v_min - W_A*VA)/W_B; // volts
+  float VB_max = (node_v_max - W_A*VA)/W_B; // volts
+
+  win_comp_low = false; win_comp_high=false; win_invalid=false;
+
+  // If floor already above max endpoint: window invalid (floor too high)
+  if (W_A*VA >= node_v_max){
+    win_invalid = true;
+    // Collapse window at floor-implied level: physical duty span zero
+    VB_min = VB_max = 0.0f; // we will drive 0 on lift channel (floor alone exceeds target window)
+  }
+
+  // If VB_min <= 0 => floor alone achieves (or exceeds) node_v_min → compress low side
+  if (VB_min <= 0.0f){ VB_min = 0.0f; win_comp_low=true; }
+  // If VB_max beyond supply (3.3V) we cannot reach full node_v_max
+  if (VB_max >= 3.3f){ VB_max = 3.3f; win_comp_high=true; }
+  // Guard if after adjustments VB_max < VB_min (extreme floor raise). Treat as collapsed window
+  if (VB_max < VB_min + 0.0005f){ VB_max = VB_min; }
+
+  dutyB_min_phys = (VB_min/3.3f)*100.0f;
+  dutyB_max_phys = (VB_max/3.3f)*100.0f;
+  if (dutyB_min_phys < 0) dutyB_min_phys = 0; if (dutyB_min_phys > 100) dutyB_min_phys = 100;
+  if (dutyB_max_phys < 0) dutyB_max_phys = 0; if (dutyB_max_phys > 100) dutyB_max_phys = 100;
+
+  float dutyB_tgt_phys;
+  if (dutyB_max_phys <= dutyB_min_phys){
+    // Collapsed window → any logical value maps to min
+    dutyB_tgt_phys = dutyB_min_phys;
+  } else {
+    float normL = clamp01(lift_logical/100.0f);
+    dutyB_tgt_phys = dutyB_min_phys + (dutyB_max_phys - dutyB_min_phys)*normL;
+  }
+
+  // Slew limit (50 ms loop) on PHYSICAL duty
   static float dutyB = 100;                 // boot safe
-  float delta = dutyB_tgt - dutyB;
+  float delta = dutyB_tgt_phys - dutyB;
   float step  = (50.0f / attack_ms);        // % per tick
   if      (delta >  step) dutyB += step;
   else if (delta < -step) dutyB -= step;
-  else                    dutyB  = dutyB_tgt;
+  else                    dutyB  = dutyB_tgt_phys;
   dutyB_now = dutyB;
 
   // Apply PWMs
@@ -159,9 +226,8 @@ void updateControl(){
   ledcWrite(PWM_CH_B, toDutyCounts(dutyB));
 
   // Model fan node voltage (for display)
-  float VA=3.3f*(floor_pct/100.0f);
   float VB=3.3f*(dutyB/100.0f);
-  vfan_model = (VA/10000.0f + VB/5100.0f) / (1/10000.0f + 1/5100.0f);
+  vfan_model = (VA/R_A + VB/R_B) / (1.0f/R_A + 1.0f/R_B);
 
   // Measure fan node via GPIO3 feedback (factory-calibrated path then trimmed)
   {
@@ -194,12 +260,28 @@ String htmlPage(){
   h+=".value-display{min-width:80px;font-family:monospace;font-size:14px;text-align:right}";
   h+=".reset-btn{padding:4px 8px;font-size:12px;border:1px solid #ccc;background:#f8f8f8;border-radius:3px;cursor:pointer}";
   h+=".reset-btn:hover{background:#e8e8e8}";
+  h+=".lock-btn{padding:4px 8px;font-size:11px;border:1px solid #999;background:#eee;color:#333;border-radius:3px;cursor:pointer}";
+  h+=".lock-btn.active{background:#ffc107;border-color:#e0a800;color:#222}";
+  h+=".lock-btn:disabled{opacity:0.4;cursor:not-allowed}";
+  h+=".control-group.disabled{opacity:0.55}";
   h+=".btn{padding:8px 16px;margin:5px;border:1px solid #007bff;background:#007bff;color:white;border-radius:4px;cursor:pointer}";
   h+=".btn:hover{background:#0056b3}";
   h+=".btn.secondary{background:#6c757d;border-color:#6c757d}";
   h+=".btn.danger{background:#dc3545;border-color:#dc3545}";
+  h+=".help-btn{background:#17a2b8;border-color:#17a2b8}";
+  h+=".help-btn:hover{background:#11707f}";
   h+="table{border-collapse:collapse;margin-top:8px} td,th{border:1px solid #ccc;padding:4px 6px;font-size:12px}";
   h+="#charts{display:grid;gap:12px;grid-template-columns:1fr} canvas{width:100%;height:220px;border:1px solid #ddd;border-radius:6px}";
+  h+="#helpOverlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);display:none;align-items:flex-start;justify-content:center;z-index:9999;padding:40px 10px;box-sizing:border-box}";
+  h+="#helpContent{background:#fff;max-width:860px;width:100%;max-height:100%;overflow:auto;padding:24px 28px;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,0.25);font-size:14px;line-height:1.5}";
+  h+="#helpContent h2{margin-top:0;font-size:22px}";
+  h+="#helpContent h3{margin:24px 0 8px;font-size:18px}";
+  h+="#helpContent code{background:#f1f3f5;padding:2px 5px;border-radius:3px;font-size:13px}";
+  h+="#helpContent table{width:100%;border-collapse:collapse;margin:8px 0 16px}";
+  h+="#helpContent th,#helpContent td{border:1px solid #ddd;padding:6px 8px;text-align:left;vertical-align:top}";
+  h+="#helpContent tr:nth-child(even){background:#fafafa}";
+  h+="#closeHelp{float:right;font-size:16px;cursor:pointer;background:#eee;border:1px solid #ccc;border-radius:4px;padding:2px 10px;margin:-8px -8px 8px 8px}";
+  h+="#closeHelp:hover{background:#ddd}";
   h+="</style></head><body>";
   
   h+="<div class='container'>";
@@ -213,6 +295,8 @@ String htmlPage(){
   h+="<tr><td>Fan Node (model)</td><td><span id='vfan'>?</span> V</td><td>Resistor network prediction</td></tr>";
   h+="<tr><td>Fan Node (meas)</td><td><span id='vfanm'>?</span> V</td><td>ADC feedback</td></tr>";
   h+="<tr><td>Lift PWM</td><td><span id='dutyB'>?</span> %</td><td>After slew limiting</td></tr>";
+  h+="<tr><td>Duty Window</td><td><span id='dutyRange'>?–?</span> %</td><td>Physical PWM_B range for 0–100 logical</td></tr>";
+  h+="<tr><td>Win Flags</td><td><span id='winFlags'>?</span></td><td>compL/compH/inval/autoFloor</td></tr>";
   h+="<tr><td>Temp HOT</td><td><span id='temp0'>?</span> °C</td><td>Highest valid sensor</td></tr>";
   h+="<tr><td>Temp OTHER</td><td><span id='temp1'>—</span> °C</td><td>Second sensor (if any)</td></tr>";
   h+="<tr><td>Sensors</td><td><span id='dscount'>0</span></td><td>Detected DS18B20 count</td></tr>";
@@ -225,79 +309,109 @@ String htmlPage(){
 
   h+="<div class='section'>";
   h+="<h3>PS4 Input Mapping</h3>";
-  h+="<div class='control-group'>";
+  h+="<div class='control-group' data-for='vin_min_v'>";
+  h+="<button class='lock-btn' id='toggle_vin_min_v' onclick=\"toggleEdit('vin_min_v')\">Edit</button>";
   h+="<label for='vin_min_v'>Vin Min (V):</label>";
-  h+="<input type='range' id='vin_min_v' class='slider' min='0.50' max='1.00' step='0.001' value='"+String(vin_min_v,3)+"' oninput='updateDisplay(\"vin_min_v\", this.value, 3); applyVinConstraints();'>";
+  h+="<input disabled type='range' id='vin_min_v' class='slider' min='0.50' max='1.00' step='0.001' value='"+String(vin_min_v,3)+"' oninput='updateDisplay(\"vin_min_v\", this.value, 3); applyVinConstraints();'>";
   h+="<span class='value-display' id='vin_min_v_val'>"+String(vin_min_v,3)+"</span>";
-  h+="<button class='reset-btn' onclick=\"resetParam('vin_min_v')\">↺</button>";
+  h+="<button disabled class='reset-btn' id='reset_vin_min_v' onclick=\"resetParam('vin_min_v')\">↺</button>";
   h+="</div>";
   h+="<div class='control-group'>";
+  h+="<button class='lock-btn' id='toggle_vin_max_v' onclick=\"toggleEdit('vin_max_v')\">Edit</button>";
   h+="<label for='vin_max_v'>Vin Max (V):</label>";
-  h+="<input type='range' id='vin_max_v' class='slider' min='0.70' max='1.20' step='0.001' value='"+String(vin_max_v,3)+"' oninput='updateDisplay(\"vin_max_v\", this.value, 3); applyVinConstraints();'>";
+  h+="<input disabled type='range' id='vin_max_v' class='slider' min='0.70' max='1.20' step='0.001' value='"+String(vin_max_v,3)+"' oninput='updateDisplay(\"vin_max_v\", this.value, 3); applyVinConstraints();'>";
   h+="<span class='value-display' id='vin_max_v_val'>"+String(vin_max_v,3)+"</span>";
-  h+="<button class='reset-btn' onclick=\"resetParam('vin_max_v')\">↺</button>";
+  h+="<button disabled class='reset-btn' id='reset_vin_max_v' onclick=\"resetParam('vin_max_v')\">↺</button>";
   h+="</div>";
   h+="</div>";
 
   h+="<div class='section'>";
   h+="<h3>Output Shaping</h3>";
-  h+="<div class='control-group'>";
+  h+="<div class='control-group' data-for='floor_pct'>";
+  h+="<button class='lock-btn' id='toggle_floor_pct' onclick=\"toggleEdit('floor_pct')\">Edit</button>";
   h+="<label for='floor_pct'>Floor (%):</label>";
-  h+="<input type='range' id='floor_pct' class='slider' min='20' max='40' step='0.1' value='"+String(floor_pct,1)+"' oninput='updateDisplay(\"floor_pct\", this.value, 1);'>";
+  h+="<input disabled type='range' id='floor_pct' class='slider' min='20' max='40' step='0.1' value='"+String(floor_pct,1)+"' oninput='updateDisplay(\"floor_pct\", this.value, 1);'>";
   h+="<span class='value-display' id='floor_pct_val'>"+String(floor_pct,1)+"</span>";
-  h+="<button class='reset-btn' onclick=\"resetParam('floor_pct')\">↺</button>";
+  h+="<button disabled class='reset-btn' id='reset_floor_pct' onclick=\"resetParam('floor_pct')\">↺</button>";
+  h+="</div>";
+  // Node voltage window section
+  h+="<div class='section'>";
+  h+="<h3>Fan Node Voltage Window</h3>";
+  h+="<p style='font-size:12px;margin-top:-4px;color:#444'>Defines the measured fan control node voltage span for 0–100% logical lift. Output mapping is compressed into this window.</p>";
+  h+="<div class='control-group'>";
+  h+="<button class='lock-btn' id='toggle_node_v_min' onclick=\"toggleEdit('node_v_min')\">Edit</button>";
+  h+="<label for='node_v_min'>Node V Min:</label>";
+  h+="<input disabled type='range' id='node_v_min' class='slider' min='0.80' max='1.50' step='0.001' value='"+String(node_v_min,3)+"' oninput='updateDisplay(\"node_v_min\", this.value, 3);'>";
+  h+="<span class='value-display' id='node_v_min_val'>"+String(node_v_min,3)+"</span>";
+  h+="<button disabled class='reset-btn' id='reset_node_v_min' onclick=\"resetParam('node_v_min')\">↺</button>";
   h+="</div>";
   h+="<div class='control-group'>";
+  h+="<button class='lock-btn' id='toggle_node_v_max' onclick=\"toggleEdit('node_v_max')\">Edit</button>";
+  h+="<label for='node_v_max'>Node V Max:</label>";
+  h+="<input disabled type='range' id='node_v_max' class='slider' min='0.90' max='1.70' step='0.001' value='"+String(node_v_max,3)+"' oninput='updateDisplay(\"node_v_max\", this.value, 3);'>";
+  h+="<span class='value-display' id='node_v_max_val'>"+String(node_v_max,3)+"</span>";
+  h+="<button disabled class='reset-btn' id='reset_node_v_max' onclick=\"resetParam('node_v_max')\">↺</button>";
+  h+="</div>";
+  h+="</div>"; // end window section
+  h+="<div class='control-group'>";
+  h+="<button class='lock-btn' id='toggle_lift_span' onclick=\"toggleEdit('lift_span')\">Edit</button>";
   h+="<label for='lift_span'>Lift Span:</label>";
-  h+="<input type='range' id='lift_span' class='slider' min='0' max='50' step='0.1' value='"+String(lift_span,1)+"' oninput='updateDisplay(\"lift_span\", this.value, 1);'>";
+  h+="<input disabled type='range' id='lift_span' class='slider' min='0' max='50' step='0.1' value='"+String(lift_span,1)+"' oninput='updateDisplay(\"lift_span\", this.value, 1);'>";
   h+="<span class='value-display' id='lift_span_val'>"+String(lift_span,1)+"</span>";
-  h+="<button class='reset-btn' onclick=\"resetParam('lift_span')\">↺</button>";
+  h+="<button disabled class='reset-btn' id='reset_lift_span' onclick=\"resetParam('lift_span')\">↺</button>";
   h+="</div>";
   h+="<div class='control-group'>";
+  h+="<button class='lock-btn' id='toggle_fan_max' onclick=\"toggleEdit('fan_max')\">Edit</button>";
   h+="<label for='fan_max'>Fan Max (%):</label>";
-  h+="<input type='range' id='fan_max' class='slider' min='20' max='100' step='0.1' value='"+String(fan_max,1)+"' oninput='updateDisplay(\"fan_max\", this.value, 1);'>";
+  h+="<input disabled type='range' id='fan_max' class='slider' min='20' max='100' step='0.1' value='"+String(fan_max,1)+"' oninput='updateDisplay(\"fan_max\", this.value, 1);'>";
   h+="<span class='value-display' id='fan_max_val'>"+String(fan_max,1)+"</span>";
-  h+="<button class='reset-btn' onclick=\"resetParam('fan_max')\">↺</button>";
+  h+="<button disabled class='reset-btn' id='reset_fan_max' onclick=\"resetParam('fan_max')\">↺</button>";
   h+="</div>";
   h+="<div class='control-group'>";
+  h+="<button class='lock-btn' id='toggle_attack_ms' onclick=\"toggleEdit('attack_ms')\">Edit</button>";
   h+="<label for='attack_ms'>Attack (ms):</label>";
-  h+="<input type='range' id='attack_ms' class='slider' min='50' max='2000' step='10' value='"+String(attack_ms,0)+"' oninput='updateDisplay(\"attack_ms\", this.value, 0);'>";
+  h+="<input disabled type='range' id='attack_ms' class='slider' min='50' max='2000' step='10' value='"+String(attack_ms,0)+"' oninput='updateDisplay(\"attack_ms\", this.value, 0);'>";
   h+="<span class='value-display' id='attack_ms_val'>"+String(attack_ms,0)+"</span>";
-  h+="<button class='reset-btn' onclick=\"resetParam('attack_ms')\">↺</button>";
+  h+="<button disabled class='reset-btn' id='reset_attack_ms' onclick=\"resetParam('attack_ms')\">↺</button>";
   h+="</div>";
   h+="<div class='control-group'>";
+  h+="<button class='lock-btn' id='toggle_temp_fail' onclick=\"toggleEdit('temp_fail')\">Edit</button>";
   h+="<label for='temp_fail'>Temp Fail (°C):</label>";
-  h+="<input type='range' id='temp_fail' class='slider' min='50' max='100' step='1' value='"+String(temp_fail,0)+"' oninput='updateDisplay(\"temp_fail\", this.value, 0);'>";
+  h+="<input disabled type='range' id='temp_fail' class='slider' min='50' max='100' step='1' value='"+String(temp_fail,0)+"' oninput='updateDisplay(\"temp_fail\", this.value, 0);'>";
   h+="<span class='value-display' id='temp_fail_val'>"+String(temp_fail,0)+"</span>";
-  h+="<button class='reset-btn' onclick=\"resetParam('temp_fail')\">↺</button>";
+  h+="<button disabled class='reset-btn' id='reset_temp_fail' onclick=\"resetParam('temp_fail')\">↺</button>";
   h+="</div>";
   h+="</div>";
 
   h+="<div class='section'>";
   h+="<h3>Calibration</h3>";
   h+="<div class='control-group'>";
+  h+="<button class='lock-btn' id='toggle_cal_vin_off' onclick=\"toggleEdit('cal_vin_off')\">Edit</button>";
   h+="<label for='cal_vin_off'>Vin Offset:</label>";
-  h+="<input type='range' id='cal_vin_off' class='slider' min='-0.50' max='0.50' step='0.001' value='"+String(cal_vin_off,3)+"' oninput='updateDisplay(\"cal_vin_off\", this.value, 3);'>";
+  h+="<input disabled type='range' id='cal_vin_off' class='slider' min='-0.50' max='0.50' step='0.001' value='"+String(cal_vin_off,3)+"' oninput='updateDisplay(\"cal_vin_off\", this.value, 3);'>";
   h+="<span class='value-display' id='cal_vin_off_val'>"+String(cal_vin_off,3)+"</span>";
-  h+="<button class='reset-btn' onclick=\"resetParam('cal_vin_off')\">↺</button>";
+  h+="<button disabled class='reset-btn' id='reset_cal_vin_off' onclick=\"resetParam('cal_vin_off')\">↺</button>";
   h+="</div>";
   h+="<div class='control-group'>";
+  h+="<button class='lock-btn' id='toggle_cal_vin_gain' onclick=\"toggleEdit('cal_vin_gain')\">Edit</button>";
   h+="<label for='cal_vin_gain'>Vin Gain:</label>";
-  h+="<input type='range' id='cal_vin_gain' class='slider' min='0.80' max='1.20' step='0.001' value='"+String(cal_vin_gain,3)+"' oninput='updateDisplay(\"cal_vin_gain\", this.value, 3);'>";
+  h+="<input disabled type='range' id='cal_vin_gain' class='slider' min='0.80' max='1.20' step='0.001' value='"+String(cal_vin_gain,3)+"' oninput='updateDisplay(\"cal_vin_gain\", this.value, 3);'>";
   h+="<span class='value-display' id='cal_vin_gain_val'>"+String(cal_vin_gain,3)+"</span>";
-  h+="<button class='reset-btn' onclick=\"resetParam('cal_vin_gain')\">↺</button>";
+  h+="<button disabled class='reset-btn' id='reset_cal_vin_gain' onclick=\"resetParam('cal_vin_gain')\">↺</button>";
   h+="</div>";
   h+="<div class='control-group'>";
+  h+="<button class='lock-btn' id='toggle_cal_vfan_off' onclick=\"toggleEdit('cal_vfan_off')\">Edit</button>";
   h+="<label for='cal_vfan_off'>Vfan Offset:</label>";
-  h+="<input type='range' id='cal_vfan_off' class='slider' min='-0.50' max='0.50' step='0.001' value='"+String(cal_vfan_off,3)+"' oninput='updateDisplay(\"cal_vfan_off\", this.value, 3);'>";
+  h+="<input disabled type='range' id='cal_vfan_off' class='slider' min='-0.50' max='0.50' step='0.001' value='"+String(cal_vfan_off,3)+"' oninput='updateDisplay(\"cal_vfan_off\", this.value, 3);'>";
   h+="<span class='value-display' id='cal_vfan_off_val'>"+String(cal_vfan_off,3)+"</span>";
-  h+="<button class='reset-btn' onclick=\"resetParam('cal_vfan_off')\">↺</button>";
+  h+="<button disabled class='reset-btn' id='reset_cal_vfan_off' onclick=\"resetParam('cal_vfan_off')\">↺</button>";
   h+="</div>";
   h+="<div class='control-group'>";
+  h+="<button class='lock-btn' id='toggle_cal_vfan_gain' onclick=\"toggleEdit('cal_vfan_gain')\">Edit</button>";
   h+="<label for='cal_vfan_gain'>Vfan Gain:</label>";
-  h+="<input type='range' id='cal_vfan_gain' class='slider' min='0.80' max='1.20' step='0.001' value='"+String(cal_vfan_gain,3)+"' oninput='updateDisplay(\"cal_vfan_gain\", this.value, 3);'>";
+  h+="<input disabled type='range' id='cal_vfan_gain' class='slider' min='0.80' max='1.20' step='0.001' value='"+String(cal_vfan_gain,3)+"' oninput='updateDisplay(\"cal_vfan_gain\", this.value, 3);'>";
   h+="<span class='value-display' id='cal_vfan_gain_val'>"+String(cal_vfan_gain,3)+"</span>";
-  h+="<button class='reset-btn' onclick=\"resetParam('cal_vfan_gain')\">↺</button>";
+  h+="<button disabled class='reset-btn' id='reset_cal_vfan_gain' onclick=\"resetParam('cal_vfan_gain')\">↺</button>";
   h+="</div>";
   h+="</div>";
 
@@ -320,11 +434,41 @@ String htmlPage(){
   h+="<button class='btn' onclick='saveSettings()'>Save All Settings</button>";
   h+="<button class='btn secondary' onclick='resetAllSettings()'>Reset to Defaults</button>";
   h+="<button class='btn danger' onclick='factoryReset()'>Factory Wipe & Reboot</button>";
+  h+="<button class='btn help-btn' onclick='openHelp()'>Help</button>";
   h+="</div>";
 
   h+="<div id='charts'><canvas id='cTemp'></canvas><canvas id='cFan'></canvas><canvas id='cVfan'></canvas></div>";
   h+="<p><a href='/history' target='_blank'>Open history JSON</a></p>";
   h+="</div>"; // close container
+
+  // Help overlay HTML
+  h+="<div id='helpOverlay'><div id='helpContent'>";
+  h+="<button id='closeHelp' onclick='closeHelp()'>Close</button>";
+  h+="<h2>PS4 Fan Controller Help</h2>";
+  h+="<p>This overlay explains each control and how to calibrate and tune the system. Sliders are locked by default to prevent accidental changes. Click <strong>Edit</strong> to modify, then <strong>Lock</strong> to freeze again.</p>";
+  h+="<h3>Parameter Reference</h3>";
+  h+="<table><tr><th>Control</th><th>Description / Usage</th></tr>";
+  h+="<tr><td><code>Vin Min / Vin Max</code></td><td>Voltage window (in volts) from the PS4 control signal that maps to 0–100% of the <em>Lift Span</em>. Keep at least 0.02 V gap. Lowering <code>Vin Min</code> makes low PS4 outputs start ramp earlier; raising <code>Vin Max</code> requires a higher PS4 command to reach full span.</td></tr>";
+  h+="<tr><td><code>Floor (%)</code></td><td>Baseline duty (channel A) always applied so the fan never fully stops. Too low may stall the fan; too high wastes noise headroom.</td></tr>";
+  h+="<tr><td><code>Lift Span (%)</code></td><td>Dynamic range (channel B) added on top of Floor based on PS4 mode mapping. In temperature mode it is ignored; the temperature curve directly computes the lift percentage.</td></tr>";
+  h+="<tr><td><code>Fan Max (%)</code></td><td>Upper cap for computed lift (channel B). Use to limit noise or power. Does not affect the failsafe which still forces 100% when triggered.</td></tr>";
+  h+="<tr><td><code>Attack (ms)</code></td><td>Slew rate: time in milliseconds per 1% duty change for channel B. Smaller values = faster response, larger = smoother transitions. Effective step occurs every 50 ms loop.</td></tr>";
+  h+="<tr><td><code>Temp Fail (°C)</code></td><td>Failsafe threshold of hottest sensor. At or above this temperature the lift duty is forced to 100% regardless of mode.</td></tr>";
+  h+="<tr><td><code>Calibration Offsets / Gains</code></td><td><code>Vin Offset / Vin Gain</code> adjust the PS4 input voltage measurement; <code>Vfan Offset / Vfan Gain</code> trim the measured fan node feedback. Use calibration procedure below.</td></tr>";
+  h+="<tr><td><code>Temperature Curve (T→%)</code></td><td>Five points (T1..T5 mapped to F1..F5). Interpolated linearly. Ensure temperatures are strictly increasing for predictable control. Fan % can exceed earlier points but generally should be non-decreasing.</td></tr>";
+  h+="</table>";
+  h+="<h3>Calibration Procedure</h3>";
+  h+="<ol style='margin-left:18px;padding-left:4px'>";
+  h+="<li>Leave system at default values and allow readings to stabilize.</li>";
+  h+="<li>Inject a known reference voltage (or rely on PS4 idle) to the PS4 control line. Note the reported <strong>Vin</strong>. Adjust <code>Vin Offset</code> until the reading matches the expected baseline.</li>";
+  h+="<li>Apply a higher known voltage (or command higher fan in PS4). If scaling is off (e.g., reading too compressed), adjust <code>Vin Gain</code> slightly (0.80–1.20 range) until both low and high match.</li>";
+  h+="<li>For fan node feedback, compare <strong>Fan Node (meas)</strong> vs <strong>Fan Node (model)</strong>. First align offset (<code>Vfan Offset</code>) at a low duty, then use <code>Vfan Gain</code> to align at a higher duty.</li>";
+  h+="<li>Repeat small adjustments—prefer tiny changes (<=0.005 offset, <=0.01 gain) and let readings settle a few seconds.</li>";
+  h+="</ol>";
+  h+="<h3>Tuning Temperature Curve</h3><p>Start with a gentle slope to reduce oscillation. Keep points monotonic in temperature. Increase final stage (e.g. 55→100%) to guarantee full cooling headroom at high load. If reaction feels sluggish, reduce <code>Attack</code> (but not so low that fan chatters).</p>";
+  h+="<h3>Failsafe Behavior</h3><p>If all sensors become invalid or hottest temperature exceeds <code>Temp Fail</code>, the controller drives 100% lift regardless of other settings. Normal control resumes once temperature falls below threshold and sensors are valid.</p>";
+  h+="<h3>Saving & Persistence</h3><p>Press <strong>Save All Settings</strong> after edits. Curve and parameters persist in NVS. Factory wipe clears everything and reboots.</p>";
+  h+="</div></div>";
 
   h+="<script>";
   h+="// ---- EXTREME COMPATIBILITY (no arrow, no const/let, no fetch, no spread) ----\n";
@@ -338,14 +482,17 @@ String htmlPage(){
   // Correct loadConfigToUI (previous stray JS removed)
   h+="function loadConfigToUI(cfg){try{if(window.console)console.log('Config received',cfg);}catch(e){}var info={vin_min_v:3,vin_max_v:3,lift_span:1,floor_pct:1,fan_max:1,attack_ms:0,temp_fail:0,cal_vin_off:3,cal_vin_gain:3,cal_vfan_off:3,cal_vfan_gain:3};var curveKeys={};for(var i=0;i<5;i++){curveKeys['t'+i]=true;curveKeys['f'+i]=true;}var allZero=true;for(var i=0;i<5;i++){if(cfg.hasOwnProperty('t'+i)&&parseFloat(cfg['t'+i])!==0){allZero=false;break;}}if(allZero){if(window.console)console.warn('Curve all zero - using defaults');for(var i=0;i<5;i++){if(defaults.hasOwnProperty('t'+i)){cfg['t'+i]=defaults['t'+i];cfg['f'+i]=defaults['f'+i];}}}for(var k in cfg){if(!cfg.hasOwnProperty(k)||curveKeys[k])continue;var el=$(k);if(el){var dec=info.hasOwnProperty(k)?info[k]:(k.indexOf('gain')>-1||k.indexOf('off')>-1?3:1);el.value=cfg[k];updateDisplay(k,cfg[k],dec);}}for(var i=0;i<5;i++){var tk='t'+i,fk='f'+i;var tEl=$(tk),fEl=$(fk);if(tEl&&cfg.hasOwnProperty(tk))tEl.value=cfg[tk];if(fEl&&cfg.hasOwnProperty(fk))fEl.value=cfg[fk];}setupVinConstraints();}";
   h+="var __cfgTries=0;";
-  h+="function refresh(){xhrJSON('/json',function(err,data){if(err||!data)return;var vinEl=$('vin');if(!vinEl)return; $('vin').textContent=data.vin.toFixed(3);$('vfan').textContent=data.vfan.toFixed(3);$('vfanm').textContent=data.vfanm.toFixed(3);$('dutyB').textContent=data.dutyB.toFixed(1);$('temp0').textContent=(data.temp0!=null)?data.temp0.toFixed(1):'—';$('temp1').textContent=(data.temp1!=null)?data.temp1.toFixed(1):'—';$('dscount').textContent=data.dscount;$('mode').textContent=data.mode?'Temp':'PS4';$('fail').textContent=data.fail?'YES':'no';if(data.config && !configLoaded){var defaultsReady=false;for(var k in defaults){if(defaults.hasOwnProperty(k)){defaultsReady=true;break;}}var allZero=true;for(var i=0;i<5;i++){var tk='t'+i; if(!data.config.hasOwnProperty(tk)){allZero=false;break;} if(parseFloat(data.config[tk])!==0){allZero=false;break;}}if((!data.curve_ok && allZero) || !defaultsReady){ if(__cfgTries<6){ if(window.console)console.warn('Deferring config apply (try '+__cfgTries+') curve_ok='+data.curve_ok+' allZero='+allZero+' defaultsReady='+defaultsReady); __cfgTries++; setTimeout(refresh,250); return; } else { if(window.console)console.warn('Applying config after max retries; using whatever values present'); } } loadConfigToUI(data.config); configLoaded=true;}});}";
-  h+="function setupSliderListeners(){var sliders=[[\"vin_min_v\",3],[\"vin_max_v\",3],[\"lift_span\",1],[\"floor_pct\",1],[\"fan_max\",1],[\"attack_ms\",0],[\"temp_fail\",0],[\"cal_vin_off\",3],[\"cal_vin_gain\",3],[\"cal_vfan_off\",3],[\"cal_vfan_gain\",3]];";
+  h+="function refresh(){xhrJSON('/json',function(err,data){if(err||!data)return;var vinEl=$('vin');if(!vinEl)return; $('vin').textContent=data.vin.toFixed(3);$('vfan').textContent=data.vfan.toFixed(3);$('vfanm').textContent=data.vfanm.toFixed(3);$('dutyB').textContent=data.dutyB.toFixed(1);if(data.dutyB_min!=null&&data.dutyB_max!=null){$('dutyRange').textContent=data.dutyB_min.toFixed(1)+'–'+data.dutyB_max.toFixed(1);}var flags='';if(data.win_comp_low)flags+='L';if(data.win_comp_high)flags+='H';if(data.win_invalid)flags+='!';if(data.floor_auto)flags+=(flags?' ':'')+'F';$('winFlags').textContent=flags||'—';$('temp0').textContent=(data.temp0!=null)?data.temp0.toFixed(1):'—';$('temp1').textContent=(data.temp1!=null)?data.temp1.toFixed(1):'—';$('dscount').textContent=data.dscount;$('mode').textContent=data.mode?'Temp':'PS4';$('fail').textContent=data.fail?'YES':'no';if(data.config && !configLoaded){var defaultsReady=false;for(var k in defaults){if(defaults.hasOwnProperty(k)){defaultsReady=true;break;}}var allZero=true;for(var i=0;i<5;i++){var tk='t'+i; if(!data.config.hasOwnProperty(tk)){allZero=false;break;} if(parseFloat(data.config[tk])!==0){allZero=false;break;}}if((!data.curve_ok && allZero) || !defaultsReady){ if(__cfgTries<6){ if(window.console)console.warn('Deferring config apply (try '+__cfgTries+') curve_ok='+data.curve_ok+' allZero='+allZero+' defaultsReady='+defaultsReady); __cfgTries++; setTimeout(refresh,250); return; } else { if(window.console)console.warn('Applying config after max retries; using whatever values present'); } } loadConfigToUI(data.config); configLoaded=true;}});}";
+  h+="function setupSliderListeners(){var sliders=[[\"vin_min_v\",3],[\"vin_max_v\",3],[\"lift_span\",1],[\"floor_pct\",1],[\"fan_max\",1],[\"attack_ms\",0],[\"temp_fail\",0],[\"node_v_min\",3],[\"node_v_max\",3],[\"cal_vin_off\",3],[\"cal_vin_gain\",3],[\"cal_vfan_off\",3],[\"cal_vfan_gain\",3]];";
   h+="for(var i=0;i<sliders.length;i++){var id=sliders[i][0],dec=sliders[i][1];var s=$(id);if(!s)continue;(function(id,dec,s){function handler(){updateDisplay(id,s.value,dec);if(id==='vin_min_v'||id==='vin_max_v')applyVinConstraints();}s.addEventListener('input',handler);s.addEventListener('change',handler);handler();})(id,dec,s);}";
   h+="if(!window.__mirror){window.__mirror=setInterval(function(){for(var i=0;i<sliders.length;i++){var id=sliders[i][0],dec=sliders[i][1];var s=$(id);if(s)updateDisplay(id,s.value,dec);}},700);} }";
+  h+="function toggleEdit(id){var s=$(id);var r=$('reset_'+id);var b=$('toggle_'+id);if(!s||!b)return;var isDisabled=s.hasAttribute('disabled');if(isDisabled){s.removeAttribute('disabled');if(r)r.removeAttribute('disabled');b.classList.add('active');b.textContent='Lock';}else{s.setAttribute('disabled','disabled');if(r)r.setAttribute('disabled','disabled');b.classList.remove('active');b.textContent='Edit';}}";
+  h+="function openHelp(){var o=$('helpOverlay');if(o)o.style.display='flex';window.scrollTo(0,0);}";
+  h+="function closeHelp(){var o=$('helpOverlay');if(o)o.style.display='none';}";
   h+="function setupVinConstraints(){var a=$('vin_min_v'),b=$('vin_max_v');if(a&&b)applyVinConstraints();}";
   h+="function applyVinConstraints(){var a=$('vin_min_v'),b=$('vin_max_v');if(!a||!b)return;var vmin=parseFloat(a.value)||0.600;var vmax=parseFloat(b.value)||1.000;if(vmax<=vmin+0.010){vmax=vmin+0.020;b.value=vmax.toFixed(3);updateDisplay('vin_max_v',vmax,3);}b.min=(vmin+0.010).toFixed(3);a.max=(vmax-0.010).toFixed(3);}";
-  h+="function saveSettings(){var ids=['vin_min_v','vin_max_v','lift_span','floor_pct','fan_max','attack_ms','temp_fail','cal_vin_off','cal_vin_gain','cal_vfan_off','cal_vfan_gain'];var q='';for(var i=0;i<ids.length;i++){var e=$(ids[i]);if(e)q+=encodeURIComponent(ids[i])+'='+encodeURIComponent(e.value)+'&';}for(var i=0;i<5;i++){var t=$('t'+i),f=$('f'+i);if(t)q+='t'+i+'='+encodeURIComponent(t.value)+'&';if(f)q+='f'+i+'='+encodeURIComponent(f.value)+'&';}if(q.length>0)q=q.substring(0,q.length-1);xhrText('/set?'+q,function(err){if(err)alert('Save failed');else alert('Settings saved');});}";
-  h+="function resetParam(key){if(!defaults.hasOwnProperty(key))return;var e=$(key);if(!e)return;var info={'vin_min_v':3,'vin_max_v':3,'lift_span':1,'floor_pct':1,'fan_max':1,'attack_ms':0,'temp_fail':0,'cal_vin_off':3,'cal_vin_gain':3,'cal_vfan_off':3,'cal_vfan_gain':3};e.value=defaults[key];var dec=info.hasOwnProperty(key)?info[key]:1;updateDisplay(key,defaults[key],dec);if(key==='vin_min_v'||key==='vin_max_v')applyVinConstraints();}";
+  h+="function saveSettings(){var ids=['vin_min_v','vin_max_v','lift_span','floor_pct','fan_max','attack_ms','temp_fail','node_v_min','node_v_max','cal_vin_off','cal_vin_gain','cal_vfan_off','cal_vfan_gain'];var q='';for(var i=0;i<ids.length;i++){var e=$(ids[i]);if(e)q+=encodeURIComponent(ids[i])+'='+encodeURIComponent(e.value)+'&';}for(var i=0;i<5;i++){var t=$('t'+i),f=$('f'+i);if(t)q+='t'+i+'='+encodeURIComponent(t.value)+'&';if(f)q+='f'+i+'='+encodeURIComponent(f.value)+'&';}if(q.length>0)q=q.substring(0,q.length-1);xhrText('/set?'+q,function(err){if(err)alert('Save failed');else alert('Settings saved');});}";
+  h+="function resetParam(key){if(!defaults.hasOwnProperty(key))return;var e=$(key);if(!e)return;var info={'vin_min_v':3,'vin_max_v':3,'lift_span':1,'floor_pct':1,'fan_max':1,'attack_ms':0,'temp_fail':0,'node_v_min':3,'node_v_max':3,'cal_vin_off':3,'cal_vin_gain':3,'cal_vfan_off':3,'cal_vfan_gain':3};e.value=defaults[key];var dec=info.hasOwnProperty(key)?info[key]:1;updateDisplay(key,defaults[key],dec);if(key==='vin_min_v'||key==='vin_max_v')applyVinConstraints();}";
   h+="function resetTempPoint(i){var tk='t'+i,fk='f'+i;if(defaults.hasOwnProperty(tk))$('t'+i).value=defaults[tk];if(defaults.hasOwnProperty(fk))$('f'+i).value=defaults[fk];}";
   h+="function resetAllSettings(){var k;for(k in defaults){if(!defaults.hasOwnProperty(k))continue;var e=$(k);if(e){e.value=defaults[k];updateDisplay(k,defaults[k],3);}}setupVinConstraints();saveSettings();}";
   h+="function toggleMode(){xhrText('/toggle',function(){});}";
@@ -378,7 +525,9 @@ void handleDefaults(){
   j+="\"cal_vin_off\":"+String(D.cal_vin_off,3)+",";
   j+="\"cal_vin_gain\":"+String(D.cal_vin_gain,3)+",";
   j+="\"cal_vfan_off\":"+String(D.cal_vfan_off,3)+",";
-  j+="\"cal_vfan_gain\":"+String(D.cal_vfan_gain,3);
+  j+="\"cal_vfan_gain\":"+String(D.cal_vfan_gain,3)+",";
+  j+="\"node_v_min\":"+String(D.node_v_min,3)+",";
+  j+="\"node_v_max\":"+String(D.node_v_max,3);
   for(int i=0;i<5;i++){
     j+=",\"t"+String(i)+"\":"+String(D.temp_pt[i],1);
     j+=",\"f"+String(i)+"\":"+String(D.fan_pt[i],1);
@@ -397,6 +546,8 @@ void handleSet(){
   if(server.hasArg("fan_max"))fan_max=server.arg("fan_max").toFloat();
   if(server.hasArg("attack_ms"))attack_ms=server.arg("attack_ms").toFloat();
   if(server.hasArg("temp_fail"))temp_fail=server.arg("temp_fail").toFloat();
+  if(server.hasArg("node_v_min")) node_v_min = server.arg("node_v_min").toFloat();
+  if(server.hasArg("node_v_max")) node_v_max = server.arg("node_v_max").toFloat();
   if(server.hasArg("cal_vin_off"))  cal_vin_off = server.arg("cal_vin_off").toFloat();
   if(server.hasArg("cal_vin_gain")) cal_vin_gain= server.arg("cal_vin_gain").toFloat();
   if(server.hasArg("cal_vfan_off")) cal_vfan_off= server.arg("cal_vfan_off").toFloat();
@@ -455,6 +606,9 @@ void handleSet(){
   fan_max   = sane(fan_max,   10.0f, 100.0f, D.fan_max);
   attack_ms = sane(attack_ms, 20.0f, 4000.0f, D.attack_ms);
   temp_fail = sane(temp_fail, 50.0f, 100.0f, D.temp_fail);
+  node_v_min = sane(node_v_min, 0.80f, 1.50f, D.node_v_min);
+  node_v_max = sane(node_v_max, 0.85f, 1.70f, D.node_v_max);
+  if(node_v_max < node_v_min + 0.01f) node_v_max = node_v_min + 0.01f;
 
   cal_vin_gain  = sane(cal_vin_gain,  0.80f, 1.20f, D.cal_vin_gain);
   cal_vfan_gain = sane(cal_vfan_gain, 0.80f, 1.20f, D.cal_vfan_gain);
@@ -471,6 +625,8 @@ void handleSet(){
   prefs.putFloat("fan_max",fan_max);
   prefs.putFloat("attack_ms",attack_ms);
   prefs.putFloat("temp_fail",temp_fail);
+  prefs.putFloat("node_v_min",node_v_min);
+  prefs.putFloat("node_v_max",node_v_max);
   prefs.putFloat("cal_vin_off",  cal_vin_off);
   prefs.putFloat("cal_vin_gain", cal_vin_gain);
   prefs.putFloat("cal_vfan_off", cal_vfan_off);
@@ -483,6 +639,8 @@ void handleSet(){
   prefs.end();
 
   server.send(200,"text/plain","OK");
+  // Reset auto event flag after explicit user save
+  floor_auto_event = false;
 }
 
 void handleJson(){
@@ -499,6 +657,13 @@ void handleJson(){
   j+="\"vfan\":"+String(vfan_model,3)+",";
   j+="\"vfanm\":"+String(vfan_meas,3)+",";
   j+="\"dutyB\":"+String(dutyB_now,1)+",";
+  // Normalization diagnostics
+  j+="\"dutyB_min\":"+String(dutyB_min_phys,1)+",";
+  j+="\"dutyB_max\":"+String(dutyB_max_phys,1)+",";
+  j+="\"win_comp_low\":" + String(win_comp_low?"true":"false") + ",";
+  j+="\"win_comp_high\":" + String(win_comp_high?"true":"false") + ",";
+  j+="\"win_invalid\":" + String(win_invalid?"true":"false") + ",";
+  j+="\"floor_auto\":" + String(floor_auto_event?"true":"false") + ",";
   j+="\"curve_ok\":" + String(curve_ok?"true":"false") + ","; // flag for UI to decide retry/fallback
   if (tempValid(temp_hot))   j+="\"temp0\":"+String(temp_hot,1)+","; else j+="\"temp0\":null,";
   if (tempValid(temp_other)) j+="\"temp1\":"+String(temp_other,1)+","; else j+="\"temp1\":null,";
@@ -518,7 +683,9 @@ void handleJson(){
   j+="\"cal_vin_off\":"+String(cal_vin_off,3)+",";
   j+="\"cal_vin_gain\":"+String(cal_vin_gain,3)+",";
   j+="\"cal_vfan_off\":"+String(cal_vfan_off,3)+",";
-  j+="\"cal_vfan_gain\":"+String(cal_vfan_gain,3);
+  j+="\"cal_vfan_gain\":"+String(cal_vfan_gain,3)+",";
+  j+="\"node_v_min\":"+String(node_v_min,3)+",";
+  j+="\"node_v_max\":"+String(node_v_max,3);
   for(int i=0;i<5;i++){
     j+=",\"t"+String(i)+"\":"+String(temp_pt[i],1);
     j+=",\"f"+String(i)+"\":"+String(fan_pt[i],1);
@@ -636,6 +803,47 @@ void loop(){
   server.handleClient();
   if (millis()-lastUpdate > 50){
     updateControl();
+    // After updateControl we have new dutyB_now and vfan_model + vfan_meas. Clamp strategy:
+    // 1. Compute predicted node voltage bounds & adjust duty target next cycle by clamping if necessary.
+    // 2. Auto-raise floor if measured node persistently below node_v_min.
+    static float dutyAdjust=0; // not yet used for integral corrections
+    // Use measured when valid else model
+    float vnode = vfan_meas > 0.05f ? vfan_meas : vfan_model;
+    // Clamp high: if above node_v_max, reduce dutyB_now proportionally (modify dutyB_now directly for immediate effect)
+    if (vnode > node_v_max + 0.002f){
+      // Solve VB needed for node_v_max keeping VA fixed
+      float VA_cur = 3.3f*(floor_pct/100.0f);
+      float wA = (1.0f/10000.0f) / (1.0f/10000.0f + 1.0f/5100.0f);
+      float wB = 1.0f - wA;
+      float VB_needed = (node_v_max - wA*VA_cur)/wB;
+      float newDutyB = (VB_needed/3.3f)*100.0f;
+      if(newDutyB < 0) newDutyB=0; if(newDutyB>100) newDutyB=100;
+      dutyB_now = newDutyB; // immediate clamp
+      ledcWrite(PWM_CH_B, toDutyCounts(dutyB_now));
+    }
+    // Auto-raise floor if node below min and duty already low-ish or temperature mode wants low output
+    if (vnode + 0.002f < node_v_min){
+      // Compute floor needed if lift were at current duty to reach node_v_min (approx invert weighting)
+      float wA = (1.0f/10000.0f) / (1.0f/10000.0f + 1.0f/5100.0f);
+      float wB = 1.0f - wA;
+      float VB_cur = 3.3f*(dutyB_now/100.0f);
+      float VA_needed = (node_v_min - wB*VB_cur)/wA;
+      float floor_needed = (VA_needed/3.3f)*100.0f;
+      if(floor_needed > floor_pct){
+        floor_pct = sane(floor_needed, 5.0f, 80.0f, floor_pct);
+        ledcWrite(PWM_CH_A, toDutyCounts(floor_pct));
+        floor_auto_event = true;
+        floor_dirty = true; // schedule persistence
+      }
+    }
+    // Debounced persistence of auto-raised floor (every 5s max)
+    if(floor_dirty && millis()-lastFloorPersist > 5000){
+      prefs.begin("fan", false);
+      prefs.putFloat("floor_pct", floor_pct);
+      prefs.end();
+      floor_dirty = false;
+      lastFloorPersist = millis();
+    }
     lastUpdate = millis();
   }
   // Heartbeat every second so late-attached monitors show activity
