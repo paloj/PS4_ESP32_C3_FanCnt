@@ -69,6 +69,7 @@ float cal_vfan_gain = D.cal_vfan_gain, cal_vfan_off = D.cal_vfan_off;
 
 // -------- LIVE VARS ----------
 float vin_now=0, vfan_model=0, vfan_meas=0, dutyB_now=0;
+float vin_raw=0, vfan_raw=0; // pre-filter instantaneous averages
 float temp_hot=0;       // hottest DS18B20 (used for control)
 float temp_other=NAN;   // the other (display only)
 int   ds_count=0;
@@ -94,6 +95,23 @@ constexpr float R_B = 5100.0f;
 constexpr float W_A = (1.0f/R_A)/((1.0f/R_A)+(1.0f/R_B));
 constexpr float W_B = 1.0f - W_A; // should be ~0.6623
 
+// -------- AUTO CALIBRATION (node voltage) ----------
+enum AutoCalState { AC_IDLE=0, AC_P1_SET, AC_P1_WAIT, AC_P1_EVAL, AC_P2_SET, AC_P2_WAIT, AC_P2_EVAL, AC_DONE, AC_ERROR=-1 };
+AutoCalState ac_state = AC_IDLE;
+float ac_floor_lo=5.0f, ac_floor_hi=80.0f, ac_floor_mid=32.0f; // search bounds for floor (% duty)
+float ac_lift_lo=0.0f, ac_lift_hi=100.0f, ac_lift_mid=50.0f;   // search bounds for lift duty
+int   ac_iter_floor=0, ac_iter_lift=0;
+const int AC_MAX_ITER=12;             // binary search depth (~0.02% resolution < we need voltage resolution dominated by ADC noise)
+unsigned long ac_step_time=0;         // timestamp when new mid applied
+const unsigned long AC_SETTLE_MS=120; // wait for RC settle & averaging
+float ac_target_min=0, ac_target_max=0; // cached targets
+float cal_dutyB_max = -1;             // measured physical duty needed for node_v_max (VB)
+bool  cal_valid=false;                // set true when both phases succeed
+float ac_last_v=0;                    // last measured node
+String ac_error_msg="";
+// helper to invalidate calibration when config changes
+void invalidateCal(){ cal_valid=false; cal_dutyB_max=-1; if(ac_state!=AC_IDLE) ac_state=AC_ERROR; }
+
 // -------- HISTORY ----------
 struct Sample { unsigned long t; float thot, toth, vin, vfan_mod, vfan_mea, duty; };
 #define HISTORY_LEN 300
@@ -118,6 +136,13 @@ float interpCurve(float t){
     }
   }
   return fan_pt[4];
+}
+
+// Average current measured fan node voltage (simple moving fetch of ADC for calibration accuracy)
+float readFanNodeAveraged(int samples){
+  if(samples<1) samples=1; if(samples>32) samples=32;
+  float sum=0; for(int i=0;i<samples;i++){ int mv_fb = analogReadMilliVolts(PIN_FAN_FB); float v = (mv_fb/1000.0f) * cal_vfan_gain + cal_vfan_off; sum+=v; }
+  return sum / samples;
 }
 
 auto sane = [](float v,float lo,float hi,float d)->float{
@@ -154,13 +179,19 @@ void updateControl(){
 
   if (!use_temp_mode && !fan_fail){
     // PS4 mode: read Vin using factory-calibrated conversion
-    int mv_in = analogReadMilliVolts(PIN_PS4_IN);    // 0..3300 mV (ADC_11db)
-    float vin = (mv_in/1000.0f) * cal_vin_gain + cal_vin_off;
-    vin_now   = vin;
+    // Average several samples for noise reduction
+    const int VIN_SAMPLES = 6;
+    float sumVin=0;
+    for(int i=0;i<VIN_SAMPLES;i++){ int mv_in = analogReadMilliVolts(PIN_PS4_IN); sumVin += (mv_in/1000.0f); }
+    float vin_avg = (sumVin / VIN_SAMPLES) * cal_vin_gain + cal_vin_off;
+    vin_raw = vin_avg;
+    // Exponential smoothing for stable control (time constant ~ 300 ms at 50 ms loop with alpha=0.15)
+    const float ALPHA_VIN = 0.15f;
+    vin_now = (vin_now==0?vin_avg:(vin_now + ALPHA_VIN*(vin_avg - vin_now)));
 
-    if (vin < 0.05 || vin > 3.30) fan_fail = true;
+  if (vin_now < 0.05f || vin_now > 3.30f) fan_fail = true;
 
-    float norm = clamp01((vin - vin_min_v) / (vin_max_v - vin_min_v));
+  float norm = clamp01((vin_now - vin_min_v) / (vin_max_v - vin_min_v));
     lift_logical  = lift_span * norm;
     if (lift_logical > fan_max) lift_logical = fan_max; // fan_max acts as logical cap pre-normalization
   }
@@ -172,6 +203,7 @@ void updateControl(){
   // Failsafe: over temperature → full fan
   if (tempValid(temp_hot) && temp_hot >= temp_fail) fan_fail = true;
   if (fan_fail) lift_logical = 100.0f;
+
 
   // --- Map logical lift (0..100) into physical PWM_B duty range that produces node_v_min..node_v_max ---
   // Compute current VA from floor
@@ -204,6 +236,11 @@ void updateControl(){
   if (dutyB_max_phys < 0) dutyB_max_phys = 0; if (dutyB_max_phys > 100) dutyB_max_phys = 100;
 
   float dutyB_tgt_phys;
+  // If calibration valid, override computed physical window high end
+  if(cal_valid && cal_dutyB_max >= dutyB_min_phys){
+    dutyB_max_phys = cal_dutyB_max; // trust measured upper bound
+    if(dutyB_max_phys < dutyB_min_phys) dutyB_max_phys = dutyB_min_phys;
+  }
   if (dutyB_max_phys <= dutyB_min_phys){
     // Collapsed window → any logical value maps to min
     dutyB_tgt_phys = dutyB_min_phys;
@@ -231,8 +268,87 @@ void updateControl(){
 
   // Measure fan node via GPIO3 feedback (factory-calibrated path then trimmed)
   {
-    int mv_fb = analogReadMilliVolts(PIN_FAN_FB);
-    vfan_meas = (mv_fb/1000.0f) * cal_vfan_gain + cal_vfan_off;
+    const int VFAN_SAMPLES = 6;
+    float sumF=0;
+    for(int i=0;i<VFAN_SAMPLES;i++){ int mv_fb = analogReadMilliVolts(PIN_FAN_FB); sumF += (mv_fb/1000.0f); }
+    float vfan_avg = (sumF / VFAN_SAMPLES) * cal_vfan_gain + cal_vfan_off;
+    vfan_raw = vfan_avg;
+    const float ALPHA_VFAN = 0.18f; // slightly quicker tracking
+    vfan_meas = (vfan_meas==0?vfan_avg:(vfan_meas + ALPHA_VFAN*(vfan_avg - vfan_meas)));
+  }
+
+  // -------- Auto-Calibration State Machine (overrides outputs while active) --------
+  if(ac_state != AC_IDLE && ac_state != AC_DONE && ac_state != AC_ERROR){
+    unsigned long now = millis();
+    // Adaptive settle: longer early, shorter as bracket narrows
+    auto adaptiveSettle = [&](float span)->unsigned long {
+      if(span > 0.20f) return 160; // large gap
+      if(span > 0.10f) return 140;
+      if(span > 0.05f) return 120;
+      if(span > 0.02f) return 110;
+      return 100; };
+    switch(ac_state){
+      case AC_P1_SET: {
+        ac_iter_floor=0; ac_floor_lo=5.0f; ac_floor_hi=80.0f; ac_floor_mid=floor_pct; if(ac_floor_mid<5||ac_floor_mid>80) ac_floor_mid=32.0f;
+        ac_target_min = node_v_min; ac_step_time=now; ac_state=AC_P1_WAIT; break; }
+      case AC_P1_WAIT: {
+        unsigned long need = adaptiveSettle(ac_floor_hi - ac_floor_lo);
+        if(now - ac_step_time >= need){ ac_state=AC_P1_EVAL; }
+        break; }
+      case AC_P1_EVAL: {
+        ac_last_v = readFanNodeAveraged(6);
+        if(fabs(ac_last_v - ac_target_min) < 0.003f || ac_iter_floor>=AC_MAX_ITER){
+          floor_pct = ac_floor_mid; // lock
+          ac_state = AC_P2_SET; break; }
+        if(ac_last_v > ac_target_min){ ac_floor_hi = ac_floor_mid; } else { ac_floor_lo = ac_floor_mid; }
+        ac_floor_mid = (ac_floor_lo + ac_floor_hi)/2.0f; ac_iter_floor++; ac_step_time=now; ac_state=AC_P1_WAIT; break; }
+      case AC_P2_SET: {
+        ac_iter_lift=0; ac_lift_lo=0.0f; ac_lift_hi=100.0f; ac_lift_mid = dutyB_now>0?dutyB_now:50.0f;
+        ac_target_max = node_v_max; ac_step_time=now; ac_state=AC_P2_WAIT; break; }
+      case AC_P2_WAIT: {
+        unsigned long need = adaptiveSettle(ac_lift_hi - ac_lift_lo);
+        if(now - ac_step_time >= need){ ac_state=AC_P2_EVAL; }
+        break; }
+      case AC_P2_EVAL: {
+        ac_last_v = readFanNodeAveraged(6);
+        if(fabs(ac_last_v - ac_target_max) < 0.003f || ac_iter_lift>=AC_MAX_ITER){
+          cal_dutyB_max = ac_lift_mid; cal_valid=true; ac_state=AC_DONE;
+          // Persist results
+          prefs.begin("fan", false);
+          prefs.putFloat("floor_pct", floor_pct);
+          prefs.putFloat("cal_dutyB_max", cal_dutyB_max);
+          prefs.putBool("cal_valid", true);
+          prefs.end();
+          break; }
+        if(ac_last_v > ac_target_max){ ac_lift_hi = ac_lift_mid; } else { ac_lift_lo = ac_lift_mid; }
+        ac_lift_mid = (ac_lift_lo + ac_lift_hi)/2.0f; ac_iter_lift++; ac_step_time=now; ac_state=AC_P2_WAIT; break; }
+      default: break;
+    }
+    // Logging after state change (concise)
+    if(Serial){
+      static AutoCalState lastLogged=AC_IDLE; static unsigned long lastLogMs=0;
+      if(ac_state!=lastLogged && millis()-lastLogMs>40){
+        Serial.printf("[AutoCal] state=%d floor_mid=%.2f lift_mid=%.2f v=%.3f itF=%d itL=%d\n", (int)ac_state, ac_floor_mid, ac_lift_mid, ac_last_v, ac_iter_floor, ac_iter_lift);
+        lastLogged=ac_state; lastLogMs=millis();
+      }
+      if(ac_state==AC_DONE){ Serial.printf("[AutoCal] DONE floor=%.2f dutyB_max=%.2f\n", floor_pct, cal_dutyB_max); }
+      if(ac_state==AC_ERROR){ Serial.printf("[AutoCal] ERROR %s\n", ac_error_msg.c_str()); }
+    }
+    // Timeout / error
+    if( (ac_state==AC_P1_EVAL && ac_iter_floor>=AC_MAX_ITER+2) || (ac_state==AC_P2_EVAL && ac_iter_lift>=AC_MAX_ITER+2) ){
+      ac_state = AC_ERROR; ac_error_msg = "Exceeded iterations"; cal_valid=false;
+    }
+    // While calibrating in phase 1
+    if(ac_state==AC_P1_SET || ac_state==AC_P1_WAIT || ac_state==AC_P1_EVAL){
+      ledcWrite(PWM_CH_A, toDutyCounts(ac_floor_mid));
+      ledcWrite(PWM_CH_B, toDutyCounts(0));
+      dutyB_now = 0; return; }
+    // Phase 2 active
+    if(ac_state==AC_P2_SET || ac_state==AC_P2_WAIT || ac_state==AC_P2_EVAL){
+      ledcWrite(PWM_CH_A, toDutyCounts(floor_pct));
+      ledcWrite(PWM_CH_B, toDutyCounts(ac_lift_mid));
+      dutyB_now = ac_lift_mid; return; }
+    // If done or error we fall through to normal mapping using results (if any)
   }
 
   // Log every second
@@ -297,6 +413,7 @@ String htmlPage(){
   h+="<tr><td>Lift PWM</td><td><span id='dutyB'>?</span> %</td><td>After slew limiting</td></tr>";
   h+="<tr><td>Duty Window</td><td><span id='dutyRange'>?–?</span> %</td><td>Physical PWM_B range for 0–100 logical</td></tr>";
   h+="<tr><td>Win Flags</td><td><span id='winFlags'>?</span></td><td>compL/compH/inval/autoFloor</td></tr>";
+  h+="<tr><td>AutoCal</td><td><span id='acStatus'>—</span></td><td>floor / lift calibration</td></tr>";
   h+="<tr><td>Temp HOT</td><td><span id='temp0'>?</span> °C</td><td>Highest valid sensor</td></tr>";
   h+="<tr><td>Temp OTHER</td><td><span id='temp1'>—</span> °C</td><td>Second sensor (if any)</td></tr>";
   h+="<tr><td>Sensors</td><td><span id='dscount'>0</span></td><td>Detected DS18B20 count</td></tr>";
@@ -431,6 +548,7 @@ String htmlPage(){
   h+="<div class='section'>";
   h+="<h3>Controls</h3>";
   h+="<button class='btn' onclick='toggleMode()'>Toggle PS4/Temp Mode</button>";
+  h+="<button class='btn' onclick='startAutoCal()'>Auto Cal Node</button>";
   h+="<button class='btn' onclick='saveSettings()'>Save All Settings</button>";
   h+="<button class='btn secondary' onclick='resetAllSettings()'>Reset to Defaults</button>";
   h+="<button class='btn danger' onclick='factoryReset()'>Factory Wipe & Reboot</button>";
@@ -476,13 +594,13 @@ String htmlPage(){
   h+="function updateDisplay(id,val,dec){var d=$(id+'_val');if(d){if(dec===undefined)dec=3;d.textContent=parseFloat(val).toFixed(dec);}}";
   h+="var defaults={};var configLoaded=false;";
   h+="function xhrJSON(url,cb){try{var x=new XMLHttpRequest();x.onreadystatechange=function(){if(x.readyState==4){if(x.status==200){try{cb(null,JSON.parse(x.responseText));}catch(e){cb(e);} } else cb(new Error('status '+x.status));}};x.open('GET',url,true);x.send();}catch(e){cb(e);}}";
-  h+="function xhrText(url,cb){try{var x=new XMLHttpRequest();x.onreadystatechange=function(){if(x.readyState==4){if(x.status==200)cb(null,x.responseText);else cb(new Error('status '+x.status));}};x.open('GET',url,true);x.send();}catch(e){cb(e);}}";
+  h+="function xhrText(url,cb){try{var x=new XMLHttpRequest();x.onreadystatechange=function(){if(x.readyState==4){if(x.status==200){cb(null,x.responseText);}else{cb(new Error('status '+x.status),null);}}};x.open('GET',url,true);x.send();}catch(e){cb(e,null);}}";
   h+="// Load defaults early\n";
   h+="xhrJSON('/defaults',function(err,d){if(!err && d && d.defaults){defaults=d.defaults;}});";
   // Correct loadConfigToUI (previous stray JS removed)
   h+="function loadConfigToUI(cfg){try{if(window.console)console.log('Config received',cfg);}catch(e){}var info={vin_min_v:3,vin_max_v:3,lift_span:1,floor_pct:1,fan_max:1,attack_ms:0,temp_fail:0,cal_vin_off:3,cal_vin_gain:3,cal_vfan_off:3,cal_vfan_gain:3};var curveKeys={};for(var i=0;i<5;i++){curveKeys['t'+i]=true;curveKeys['f'+i]=true;}var allZero=true;for(var i=0;i<5;i++){if(cfg.hasOwnProperty('t'+i)&&parseFloat(cfg['t'+i])!==0){allZero=false;break;}}if(allZero){if(window.console)console.warn('Curve all zero - using defaults');for(var i=0;i<5;i++){if(defaults.hasOwnProperty('t'+i)){cfg['t'+i]=defaults['t'+i];cfg['f'+i]=defaults['f'+i];}}}for(var k in cfg){if(!cfg.hasOwnProperty(k)||curveKeys[k])continue;var el=$(k);if(el){var dec=info.hasOwnProperty(k)?info[k]:(k.indexOf('gain')>-1||k.indexOf('off')>-1?3:1);el.value=cfg[k];updateDisplay(k,cfg[k],dec);}}for(var i=0;i<5;i++){var tk='t'+i,fk='f'+i;var tEl=$(tk),fEl=$(fk);if(tEl&&cfg.hasOwnProperty(tk))tEl.value=cfg[tk];if(fEl&&cfg.hasOwnProperty(fk))fEl.value=cfg[fk];}setupVinConstraints();}";
   h+="var __cfgTries=0;";
-  h+="function refresh(){xhrJSON('/json',function(err,data){if(err||!data)return;var vinEl=$('vin');if(!vinEl)return; $('vin').textContent=data.vin.toFixed(3);$('vfan').textContent=data.vfan.toFixed(3);$('vfanm').textContent=data.vfanm.toFixed(3);$('dutyB').textContent=data.dutyB.toFixed(1);if(data.dutyB_min!=null&&data.dutyB_max!=null){$('dutyRange').textContent=data.dutyB_min.toFixed(1)+'–'+data.dutyB_max.toFixed(1);}var flags='';if(data.win_comp_low)flags+='L';if(data.win_comp_high)flags+='H';if(data.win_invalid)flags+='!';if(data.floor_auto)flags+=(flags?' ':'')+'F';$('winFlags').textContent=flags||'—';$('temp0').textContent=(data.temp0!=null)?data.temp0.toFixed(1):'—';$('temp1').textContent=(data.temp1!=null)?data.temp1.toFixed(1):'—';$('dscount').textContent=data.dscount;$('mode').textContent=data.mode?'Temp':'PS4';$('fail').textContent=data.fail?'YES':'no';if(data.config && !configLoaded){var defaultsReady=false;for(var k in defaults){if(defaults.hasOwnProperty(k)){defaultsReady=true;break;}}var allZero=true;for(var i=0;i<5;i++){var tk='t'+i; if(!data.config.hasOwnProperty(tk)){allZero=false;break;} if(parseFloat(data.config[tk])!==0){allZero=false;break;}}if((!data.curve_ok && allZero) || !defaultsReady){ if(__cfgTries<6){ if(window.console)console.warn('Deferring config apply (try '+__cfgTries+') curve_ok='+data.curve_ok+' allZero='+allZero+' defaultsReady='+defaultsReady); __cfgTries++; setTimeout(refresh,250); return; } else { if(window.console)console.warn('Applying config after max retries; using whatever values present'); } } loadConfigToUI(data.config); configLoaded=true;}});}";
+  h+="function refresh(){xhrJSON('/json',function(err,data){if(err||!data)return;var vinEl=$('vin');if(!vinEl)return; $('vin').textContent=data.vin.toFixed(3);$('vfan').textContent=data.vfan.toFixed(3);$('vfanm').textContent=data.vfanm.toFixed(3);$('dutyB').textContent=data.dutyB.toFixed(1);if(data.dutyB_min!=null&&data.dutyB_max!=null){$('dutyRange').textContent=data.dutyB_min.toFixed(1)+'–'+data.dutyB_max.toFixed(1);}var flags='';if(data.win_comp_low)flags+='L';if(data.win_comp_high)flags+='H';if(data.win_invalid)flags+='!';if(data.floor_auto)flags+=(flags?' ':'')+'F';$('winFlags').textContent=flags||'—';var acMap={0:'idle',1:'floor set',2:'floor wait',3:'floor eval',4:'lift set',5:'lift wait',6:'lift eval',7:'done', '-1':'error'};var ac=acMap[data.ac_state]||data.ac_state; if(data.ac_valid) ac+=' ✓';$('acStatus').textContent=ac+(data.ac_duty_max>=0?(' max='+data.ac_duty_max.toFixed(1)+'%'):'');$('temp0').textContent=(data.temp0!=null)?data.temp0.toFixed(1):'—';$('temp1').textContent=(data.temp1!=null)?data.temp1.toFixed(1):'—';$('dscount').textContent=data.dscount;$('mode').textContent=data.mode?'Temp':'PS4';$('fail').textContent=data.fail?'YES':'no';if(data.config && !configLoaded){var defaultsReady=false;for(var k in defaults){if(defaults.hasOwnProperty(k)){defaultsReady=true;break;}}var allZero=true;for(var i=0;i<5;i++){var tk='t'+i; if(!data.config.hasOwnProperty(tk)){allZero=false;break;} if(parseFloat(data.config[tk])!==0){allZero=false;break;}}if((!data.curve_ok && allZero) || !defaultsReady){ if(__cfgTries<6){ if(window.console)console.warn('Deferring config apply (try '+__cfgTries+') curve_ok='+data.curve_ok+' allZero='+allZero+' defaultsReady='+defaultsReady); __cfgTries++; setTimeout(refresh,250); return; } else { if(window.console)console.warn('Applying config after max retries; using whatever values present'); } } loadConfigToUI(data.config); configLoaded=true;}});}";
   h+="function setupSliderListeners(){var sliders=[[\"vin_min_v\",3],[\"vin_max_v\",3],[\"lift_span\",1],[\"floor_pct\",1],[\"fan_max\",1],[\"attack_ms\",0],[\"temp_fail\",0],[\"node_v_min\",3],[\"node_v_max\",3],[\"cal_vin_off\",3],[\"cal_vin_gain\",3],[\"cal_vfan_off\",3],[\"cal_vfan_gain\",3]];";
   h+="for(var i=0;i<sliders.length;i++){var id=sliders[i][0],dec=sliders[i][1];var s=$(id);if(!s)continue;(function(id,dec,s){function handler(){updateDisplay(id,s.value,dec);if(id==='vin_min_v'||id==='vin_max_v')applyVinConstraints();}s.addEventListener('input',handler);s.addEventListener('change',handler);handler();})(id,dec,s);}";
   h+="if(!window.__mirror){window.__mirror=setInterval(function(){for(var i=0;i<sliders.length;i++){var id=sliders[i][0],dec=sliders[i][1];var s=$(id);if(s)updateDisplay(id,s.value,dec);}},700);} }";
@@ -497,6 +615,7 @@ String htmlPage(){
   h+="function resetAllSettings(){var k;for(k in defaults){if(!defaults.hasOwnProperty(k))continue;var e=$(k);if(e){e.value=defaults[k];updateDisplay(k,defaults[k],3);}}setupVinConstraints();saveSettings();}";
   h+="function toggleMode(){xhrText('/toggle',function(){});}";
   h+="function factoryReset(){if(!confirm('Erase and reboot?'))return;xhrText('/factory',function(){alert('Rebooting...');setTimeout(function(){location.reload();},1500);});}";
+  h+="function startAutoCal(){xhrText('/autocal',function(err,res){if(err){alert('AutoCal error: '+err);return;}alert('AutoCal start: '+res);});}";
   h+="function drawChart(c,xs,ys,col,yMin,yMax,yl,stats){var ctx=c.getContext('2d');var W=c.width=c.clientWidth,H=c.height=c.clientHeight;ctx.clearRect(0,0,W,H);ctx.fillStyle='#fff';ctx.fillRect(0,0,W,H);var L=50,R=8,T=8,B=22,w=W-L-R,h=H-T-B;ctx.strokeStyle='#eee';ctx.lineWidth=1;ctx.beginPath();for(var g=0;g<=4;g++){var y=T+h*g/4;ctx.moveTo(L,y);ctx.lineTo(W-R,y);}ctx.stroke();ctx.fillStyle='#444';ctx.font='11px sans-serif';for(var g=0;g<=4;g++){var val=yMax-(yMax-yMin)*g/4;var y=T+h*g/4+4;ctx.fillText(val.toFixed( (Math.abs(yMax-yMin)<5)?2:1 ),5,y);}ctx.strokeStyle='#222';ctx.beginPath();ctx.moveTo(L,T);ctx.lineTo(L,H-B);ctx.lineTo(W-R,H-B);ctx.stroke();ctx.fillStyle='#000';ctx.font='12px sans-serif';ctx.fillText(yl,5,12);if(xs.length<2)return;var x0=xs[0],x1=xs[xs.length-1];function X(x){return L+(x-x0)/( (x1-x0)||1 )*w;}function Y(y){return T+(1-(y-yMin)/( (yMax-yMin)||1 ))*h;}ctx.strokeStyle=col;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(X(xs[0]),Y(ys[0]));for(var i=1;i<xs.length;i++)ctx.lineTo(X(xs[i]),Y(ys[i]));ctx.stroke();if(stats){ctx.fillStyle='rgba(0,0,0,0.65)';ctx.font='10px monospace';var txt='min '+stats.min.toFixed(stats.dp)+'  max '+stats.max.toFixed(stats.dp)+'  cur '+stats.cur.toFixed(stats.dp)+'  avg '+stats.avg.toFixed(stats.dp);var tw=ctx.measureText(txt).width+8;var th=14;ctx.fillRect(W-tw-4,T+2,tw,th);ctx.fillStyle='#fff';ctx.fillText(txt,W-tw, T+12);} }";
   h+="function arrMin(a,def){if(a.length==0)return def;var m=a[0];for(var i=1;i<a.length;i++)if(a[i]<m)m=a[i];return Math.min(m,def);}function arrMax(a,def){if(a.length==0)return def;var m=a[0];for(var i=1;i<a.length;i++)if(a[i]>m)m=a[i];return Math.max(m,def);}";
   h+="function statObj(a){var n=a.length;var mn=a[0],mx=a[0],sum=0;for(var i=0;i<n;i++){var v=a[i];if(v<mn)mn=v;if(v>mx)mx=v;sum+=v;}return {min:mn,max:mx,cur:a[n-1],avg:sum/n,dp:(Math.abs(mx-mn)<5?2:1)};}";
@@ -664,6 +783,10 @@ void handleJson(){
   j+="\"win_comp_high\":" + String(win_comp_high?"true":"false") + ",";
   j+="\"win_invalid\":" + String(win_invalid?"true":"false") + ",";
   j+="\"floor_auto\":" + String(floor_auto_event?"true":"false") + ",";
+  // Auto calibration state
+  j+="\"ac_state\":"+String((int)ac_state)+",";
+  j+="\"ac_valid\":"+String(cal_valid?"true":"false")+",";
+  j+="\"ac_duty_max\":"+String(cal_dutyB_max,1)+",";
   j+="\"curve_ok\":" + String(curve_ok?"true":"false") + ","; // flag for UI to decide retry/fallback
   if (tempValid(temp_hot))   j+="\"temp0\":"+String(temp_hot,1)+","; else j+="\"temp0\":null,";
   if (tempValid(temp_other)) j+="\"temp1\":"+String(temp_other,1)+","; else j+="\"temp1\":null,";
@@ -724,6 +847,18 @@ void handleFactory(){
   ESP.restart();
 }
 
+void handleAutoCal(){
+  if(server.hasArg("stop")){
+    if(ac_state!=AC_IDLE){ ac_state=AC_IDLE; server.send(200,"text/plain","Cancelled"); }
+    else server.send(200,"text/plain","Not running");
+    if(Serial){ Serial.println("[AutoCal] Stop request -> set state IDLE"); }
+    return; }
+  if(ac_state!=AC_IDLE && ac_state!=AC_DONE && ac_state!=AC_ERROR){ server.send(200,"text/plain","Already running"); return; }
+  ac_state = AC_P1_SET; cal_valid=false; cal_dutyB_max=-1; ac_error_msg=""; ac_step_time=millis();
+  if(Serial){ Serial.printf("[AutoCal] START  node_v_min=%.3f node_v_max=%.3f floor_pct=%.2f dutyB_now=%.2f\n", node_v_min, node_v_max, floor_pct, dutyB_now); }
+  server.send(200,"text/plain","Started");
+}
+
 // -------- SETUP / LOOP ----------
 unsigned long lastUpdate=0;
 
@@ -779,6 +914,8 @@ void setup(){
     temp_pt[i]=prefs.getFloat(("t"+String(i)).c_str(),temp_pt[i]);
     fan_pt[i]=prefs.getFloat(("f"+String(i)).c_str(),fan_pt[i]);
   }
+  cal_dutyB_max = prefs.getFloat("cal_dutyB_max", cal_dutyB_max);
+  cal_valid     = prefs.getBool("cal_valid", false);
   prefs.end();
 
   // Sanitize & enforce small gap without hard reset
@@ -796,11 +933,178 @@ void setup(){
   server.on("/toggle",handleToggle);
   server.on("/defaults",handleDefaults);
   server.on("/factory",handleFactory);
+  server.on("/autocal",handleAutoCal);
   server.begin();
 }
 
 void loop(){
   server.handleClient();
+  // --- Simple Serial Command Parser ---
+  // Commands:
+  //   dump      -> human readable multi-line snapshot
+  //   dumpjson  -> single-line JSON with all parameters + live values
+  // (future) other commands can be added here.
+  if(Serial && Serial.available()){
+    static char cmdBuf[48];
+    static uint8_t idx=0;
+    while(Serial.available()){
+      char c=Serial.read();
+      if(c=='\r') continue; // ignore CR
+      if(c=='\n'){
+        cmdBuf[idx]='\0';
+        String cmd = String(cmdBuf);
+        cmd.trim();
+        idx=0;
+        if(cmd.length()==0) break;
+        if(cmd.equalsIgnoreCase("dump") || cmd.equalsIgnoreCase("d")){
+          Serial.println("=== DUMP (human) ===");
+          Serial.printf("Mode: %s  Fail:%s  Sensors:%d\n", use_temp_mode?"TEMP":"PS4", fan_fail?"YES":"no", ds_count);
+          Serial.printf("Temps: hot=%.2f other=%s  temp_fail=%.1f\n", temp_hot, tempValid(temp_other)?String(temp_other,2).c_str():"n/a", temp_fail);
+          Serial.printf("Vin: now=%.3f (min=%.3f max=%.3f) cal_off=%.3f cal_gain=%.3f\n", vin_now, vin_min_v, vin_max_v, cal_vin_off, cal_vin_gain);
+            Serial.printf("FanNode: model=%.3f meas=%.3f (win=%.3f..%.3f) cal_off=%.3f cal_gain=%.3f\n", vfan_model, vfan_meas, node_v_min, node_v_max, cal_vfan_off, cal_vfan_gain);
+          Serial.printf("Floor=%.2f%%  LiftSpan=%.2f%%  FanMax=%.2f%%  Attack=%.0fms\n", floor_pct, lift_span, fan_max, attack_ms);
+          Serial.printf("DutyB: now=%.2f%% window=%.2f%%..%.2f%% (flags: L=%d H=%d !=%d autoF=%d)\n", dutyB_now, dutyB_min_phys, dutyB_max_phys, win_comp_low, win_comp_high, win_invalid, floor_auto_event);
+          Serial.printf("AutoCal: state=%d valid=%d dutyB_max=%.2f lastV=%.3f floor_mid=%.2f lift_mid=%.2f itF=%d itL=%d\n", (int)ac_state, cal_valid, cal_dutyB_max, ac_last_v, ac_floor_mid, ac_lift_mid, ac_iter_floor, ac_iter_lift);
+          Serial.print("Curve T->F: ");
+          for(int i=0;i<5;i++){ Serial.printf("%.1f->%.1f%s", temp_pt[i], fan_pt[i], (i<4)?", ":"\n"); }
+          Serial.println("=== END ===");
+        } else if(cmd.equalsIgnoreCase("dumpjson") || cmd.equalsIgnoreCase("dj")){
+          // produce single-line JSON for machine ingest
+          String j="{";
+          j+="\"mode\":\"" + String(use_temp_mode?"temp":"ps4") + "\",";
+          j+="\"fail\":" + String(fan_fail?"true":"false") + ",";
+          j+="\"vin_now\":"+String(vin_now,3)+",";
+          j+="\"vin_min_v\":"+String(vin_min_v,3)+",";
+          j+="\"vin_max_v\":"+String(vin_max_v,3)+",";
+          j+="\"vfan_model\":"+String(vfan_model,3)+",";
+          j+="\"vfan_meas\":"+String(vfan_meas,3)+",";
+          j+="\"node_v_min\":"+String(node_v_min,3)+",";
+          j+="\"node_v_max\":"+String(node_v_max,3)+",";
+          j+="\"floor_pct\":"+String(floor_pct,2)+",";
+          j+="\"lift_span\":"+String(lift_span,2)+",";
+          j+="\"fan_max\":"+String(fan_max,2)+",";
+          j+="\"attack_ms\":"+String(attack_ms,0)+",";
+          j+="\"temp_fail\":"+String(temp_fail,1)+",";
+          j+="\"dutyB_now\":"+String(dutyB_now,2)+",";
+          j+="\"dutyB_min_phys\":"+String(dutyB_min_phys,2)+",";
+          j+="\"dutyB_max_phys\":"+String(dutyB_max_phys,2)+",";
+          j+="\"win_comp_low\":"+String(win_comp_low?"true":"false")+",";
+          j+="\"win_comp_high\":"+String(win_comp_high?"true":"false")+",";
+          j+="\"win_invalid\":"+String(win_invalid?"true":"false")+",";
+          j+="\"floor_auto_event\":"+String(floor_auto_event?"true":"false")+",";
+          j+="\"cal_valid\":"+String(cal_valid?"true":"false")+",";
+          j+="\"cal_dutyB_max\":"+String(cal_dutyB_max,2)+",";
+          j+="\"ac_state\":"+String((int)ac_state)+",";
+          j+="\"ac_floor_mid\":"+String(ac_floor_mid,2)+",";
+          j+="\"ac_lift_mid\":"+String(ac_lift_mid,2)+",";
+          j+="\"ac_last_v\":"+String(ac_last_v,3)+",";
+          j+="\"temp_hot\":"+(tempValid(temp_hot)?String(temp_hot,2):String("null"))+",";
+          j+="\"temp_other\":"+(tempValid(temp_other)?String(temp_other,2):String("null"))+",";
+          j+="\"ds_count\":"+String(ds_count)+",";
+          j+="\"cal_vin_off\":"+String(cal_vin_off,3)+",";
+          j+="\"cal_vin_gain\":"+String(cal_vin_gain,3)+",";
+          j+="\"cal_vfan_off\":"+String(cal_vfan_off,3)+",";
+          j+="\"cal_vfan_gain\":"+String(cal_vfan_gain,3)+",";
+          j+="\"curve\":[";
+          for(int i=0;i<5;i++){ j+="["+String(temp_pt[i],1)+","+String(fan_pt[i],1)+"]"; if(i<4) j+=","; }
+          j+="]}";
+          Serial.println(j);
+        } else if(cmd.equalsIgnoreCase("ac")){
+          if(ac_state==AC_IDLE || ac_state==AC_DONE || ac_state==AC_ERROR){
+            ac_state = AC_P1_SET; cal_valid=false; cal_dutyB_max=-1; ac_error_msg=""; ac_step_time=millis();
+            Serial.println("[AutoCal] Triggered via serial");
+          } else {
+            Serial.println("[AutoCal] Already running");
+          }
+        } else if(cmd.equalsIgnoreCase("acstop")){
+          if(ac_state!=AC_IDLE){ ac_state=AC_IDLE; Serial.println("[AutoCal] Stopped"); }
+          else Serial.println("[AutoCal] Not running");
+        } else if(cmd.equalsIgnoreCase("toggle")){
+          use_temp_mode = !use_temp_mode; prefs.begin("fan",false); prefs.putBool("mode",use_temp_mode); prefs.end();
+          Serial.printf("Mode -> %s\n", use_temp_mode?"TEMP":"PS4");
+        } else if(cmd.equalsIgnoreCase("factory") || cmd.equalsIgnoreCase("wipe")){
+          Serial.println("Factory wipe & reboot in 300ms...");
+          prefs.begin("fan", false); prefs.clear(); prefs.end(); delay(300); ESP.restart();
+        } else if(cmd.equalsIgnoreCase("history")){
+          Serial.println("[History] Most recent samples (t[s] thot vfanm duty)");
+          int n=hist_count; int shown = n<20?n:20; // last up to 20
+          int idx=(hist_head-n+HISTORY_LEN)%HISTORY_LEN;
+          for(int i=0;i<shown;i++){
+            Sample s=history[(idx + n - shown + i + HISTORY_LEN)%HISTORY_LEN];
+            Serial.printf("%lu %.1f %.3f %.1f\n", s.t, s.thot, s.vfan_mea, s.duty);
+          }
+        } else if(cmd.startsWith("set ")){
+          // Format: set key=value [key2=value2 ...]
+          String rest = cmd.substring(4); rest.trim();
+          if(rest.length()==0){ Serial.println("Usage: set key=value [key=value ...]"); }
+          else {
+            // Parse by spaces
+            int applied=0; int rejected=0; bool curveChanged=false;
+            while(rest.length()>0){
+              int sp = rest.indexOf(' ');
+              String token = (sp==-1)?rest:rest.substring(0,sp);
+              if(sp==-1) rest=""; else rest = rest.substring(sp+1);
+              token.trim(); if(token.length()==0) continue;
+              int eq = token.indexOf('=');
+              if(eq<=0 || eq==token.length()-1){ rejected++; continue; }
+              String key = token.substring(0,eq); String valStr = token.substring(eq+1);
+              key.trim(); valStr.trim();
+              float val = valStr.toFloat();
+              bool ok=true; // assume ok then sanitize
+              if(key=="vin_min_v"){ vin_min_v = sane(val,0.50f,1.00f,D.vin_min_v); }
+              else if(key=="vin_max_v"){ vin_max_v = sane(val,0.70f,1.20f,D.vin_max_v); }
+              else if(key=="floor_pct"){ floor_pct = sane(val,10.0f,60.0f,D.floor_pct); invalidateCal(); }
+              else if(key=="lift_span"){ lift_span = sane(val,0.0f,60.0f,D.lift_span); }
+              else if(key=="fan_max"){ fan_max = sane(val,10.0f,100.0f,D.fan_max); }
+              else if(key=="attack_ms"){ attack_ms = sane(val,20.0f,4000.0f,D.attack_ms); }
+              else if(key=="temp_fail"){ temp_fail = sane(val,50.0f,100.0f,D.temp_fail); }
+              else if(key=="node_v_min"){ node_v_min = sane(val,0.80f,1.50f,D.node_v_min); invalidateCal(); }
+              else if(key=="node_v_max"){ node_v_max = sane(val,0.85f,1.70f,D.node_v_max); invalidateCal(); }
+              else if(key=="cal_vin_off"){ cal_vin_off = sane(val,-0.50f,0.50f,D.cal_vin_off); }
+              else if(key=="cal_vin_gain"){ cal_vin_gain = sane(val,0.80f,1.20f,D.cal_vin_gain); }
+              else if(key=="cal_vfan_off"){ cal_vfan_off = sane(val,-0.50f,0.50f,D.cal_vfan_off); }
+              else if(key=="cal_vfan_gain"){ cal_vfan_gain = sane(val,0.80f,1.20f,D.cal_vfan_gain); }
+              else if(key.startsWith("t") && key.length()==2 && isdigit(key[1])){ int i=key[1]-'0'; if(i>=0 && i<5){ temp_pt[i]=val; curveChanged=true; } else ok=false; }
+              else if(key.startsWith("f") && key.length()==2 && isdigit(key[1])){ int i=key[1]-'0'; if(i>=0 && i<5){ fan_pt[i]=val; curveChanged=true; } else ok=false; }
+              else if(key=="mode"){ if(valStr.equalsIgnoreCase("temp")||valStr=="1"){ use_temp_mode=true; } else if(valStr.equalsIgnoreCase("ps4")||valStr=="0"){ use_temp_mode=false; } else ok=false; }
+              else { ok=false; }
+              if(ok) applied++; else rejected++;
+            }
+            // Enforce ordering on vin range & node_v window
+            if(vin_max_v <= vin_min_v + 0.01f) vin_max_v = vin_min_v + 0.02f;
+            if(node_v_max < node_v_min + 0.01f) node_v_max = node_v_min + 0.01f;
+            // Persist
+            prefs.begin("fan", false);
+            prefs.putFloat("vin_min_v",vin_min_v);
+            prefs.putFloat("vin_max_v",vin_max_v);
+            prefs.putFloat("floor_pct",floor_pct);
+            prefs.putFloat("lift_span",lift_span);
+            prefs.putFloat("fan_max",fan_max);
+            prefs.putFloat("attack_ms",attack_ms);
+            prefs.putFloat("temp_fail",temp_fail);
+            prefs.putFloat("node_v_min",node_v_min);
+            prefs.putFloat("node_v_max",node_v_max);
+            prefs.putFloat("cal_vin_off",cal_vin_off);
+            prefs.putFloat("cal_vin_gain",cal_vin_gain);
+            prefs.putFloat("cal_vfan_off",cal_vfan_off);
+            prefs.putFloat("cal_vfan_gain",cal_vfan_gain);
+            for(int i=0;i<5;i++){ prefs.putFloat(("t"+String(i)).c_str(),temp_pt[i]); prefs.putFloat(("f"+String(i)).c_str(),fan_pt[i]); }
+            prefs.putBool("mode", use_temp_mode);
+            // Calibration invalidated already if those keys touched; persist its flags
+            prefs.putFloat("cal_dutyB_max", cal_dutyB_max);
+            prefs.putBool("cal_valid", cal_valid);
+            prefs.end();
+            Serial.printf("Set applied=%d rejected=%d curveChanged=%d\n", applied, rejected, curveChanged?1:0);
+          }
+        } else {
+          Serial.print("Unknown cmd: "); Serial.println(cmd);
+          Serial.println("Commands: dump | dumpjson | ac | acstop | toggle | factory | history | set");
+        }
+      } else if(idx < sizeof(cmdBuf)-1){
+        cmdBuf[idx++]=c;
+      }
+    }
+  }
   if (millis()-lastUpdate > 50){
     updateControl();
     // After updateControl we have new dutyB_now and vfan_model + vfan_meas. Clamp strategy:
