@@ -1,56 +1,89 @@
-19:34:34.660 -> === PS4 Fan Ctrl Boot ===
-19:34:34.660 -> Build: Sep 27 2025 19:31:41
-19:34:34.660 -> CPU freq: 160 MHz  Free heap: 265976
-19:34:34.660 -> USB CDC compile flag active
-19:34:34.660 -> Chip rev: 4  SDK: v4.4.7-dirty
-19:34:34.660 -> Init peripherals...
-19:34:34.660 -> LEDC timers: A=31250.0 Hz, B=31250.0 Hz (res=10 bits)
-19:34:34.745 -> [   586][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: vin_min_v NOT_FOUND
-19:34:34.745 -> [   594][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: vin_max_v NOT_FOUND
-19:34:34.778 -> [   602][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: floor_pct NOT_FOUND
-19:34:34.778 -> [   611][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: lift_span NOT_FOUND
-19:34:34.778 -> [   619][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: fan_max NOT_FOUND
-19:34:34.778 -> [   627][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: attack_ms NOT_FOUND
-19:34:34.812 -> [   636][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: temp_fail NOT_FOUND
-19:34:34.812 -> [   644][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: cal_vin_off NOT_FOUND
-19:34:34.812 -> [   653][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: cal_vin_gain NOT_FOUND
-19:34:34.812 -> [   661][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: cal_vfan_off NOT_FOUND
-19:34:34.845 -> [   670][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: cal_vfan_gain NOT_FOUND
-19:34:34.845 -> [   679][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: t0 NOT_FOUND
-19:34:34.845 -> [   687][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: f0 NOT_FOUND
-19:34:34.845 -> [   694][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: t1 NOT_FOUND
-19:34:34.878 -> [   702][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: f1 NOT_FOUND
-19:34:34.878 -> [   710][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: t2 NOT_FOUND
-19:34:34.878 -> [   718][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: f2 NOT_FOUND
-19:34:34.878 -> [   725][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: t3 NOT_FOUND
-19:34:34.916 -> [   733][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: f3 NOT_FOUND
-19:34:34.916 -> [   741][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: t4 NOT_FOUND
-19:34:34.916 -> [   749][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: f4 NOT_FOUND
-19:34:34.916 -> [   757][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: cal_dutyB_max NOT_FOUND
-19:34:34.916 -> [   765][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: v_bias NOT_FOUND
-19:34:34.950 -> [   773][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: wA_eff NOT_FOUND
-19:34:34.950 -> [   782][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: wB_eff NOT_FOUND
-19:34:34.950 -> [   790][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: cal_baseline_meas NOT_FOUND
-19:34:34.950 -> [   799][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: learn_alpha NOT_FOUND
-19:34:34.987 -> [BOOT] floor_pct missing -> using default 77.00
-19:34:34.987 -> [   808][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: node_v_min NOT_FOUND
-19:34:34.987 -> [   816][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: node_v_max NOT_FOUND
-19:34:34.987 -> [BOOT] node_v_min missing -> using defaults min=1.044 max=1.180
-19:34:34.987 -> [BOOT] Persisted updated defaults (first-run or post-factory)
-19:34:34.987 -> [BOOT] Effective defaults: floor_pct=77.00 node_v_min=1.044 node_v_max=1.180
-19:34:36.513 -> [BOOT] Baseline capture start
-19:34:39.399 -> [  5236][E][Preferences.cpp:294] putBytes(): nvs_set_blob fail: cal_baseline_meas KEY_TOO_LONG
-19:34:39.399 -> [BOOT] Baseline captured: 1.064V (comp_low=1)
-19:34:59.757 -> [SAVE] OK (config+cal+model persisted)
-19:35:04.803 -> === DUMP (human) ===
-19:35:04.803 -> Mode: TEMP  Fail:no  Sensors:2
-19:35:04.835 -> Temps: hot=35.25 other=32.06  temp_fail=80.0
-19:35:04.835 -> Vin: now=0.000 (min=0.600 max=1.000) cal_off=0.000 cal_gain=1.000
-19:35:04.835 -> FanNode: model=1.065 meas=1.239 (win=1.044..1.180) cal_off=0.000 cal_gain=1.000
-19:35:04.835 -> Dbg: VA=2.541 VB=0.486 VB_need=0.486 vnode=1.239
-19:35:04.835 -> Floor=77.00%  LiftSpan=20.00%  FanMax=100.00%  Attack=200ms
-19:35:04.835 -> DutyB: now=14.72% window=8.50%..14.72% (flags: L=1 H=0 !=0 autoF=0)
-19:35:04.835 -> WinFlags: impossible=0 calWarnFloorHigh=0 calWarnSpanSmall=0
-19:35:04.835 -> AutoCal: state=0 valid=0 dutyB_max=-1.00 lastV=0.000 floor_mid=32.00 lift_mid=50.00 baseV=0.000 itF=0 itL=0
-19:35:04.835 -> Curve T->F: 30.0->10.0, 35.0->15.0, 40.0->20.0, 45.0->30.0, 55.0->100.0
-19:35:04.835 -> === END ===
+21:49:07.557 > === DUMP (human) ===
+21:49:07.557 > Mode: TEMP  Fail:no  Sensors:2
+21:49:07.557 > Temps: hot=28.50 other=27.44  temp_fail=80.0
+21:49:07.557 > Vin: now=0.000 (min=0.600 max=1.000) cal_off=0.000 cal_gain=1.000
+21:49:07.558 > FanNode: model=0.875 meas=1.066 (win=1.044..1.180) cal_off=0.000 cal_gain=1.000
+21:49:07.558 > Dbg: VA=2.541 VB=0.025 VB_need=0.025 vnode=1.066
+21:49:07.558 > Floor=77.00%  LiftSpan=20.00%  FanMax=100.00%  Attack=200ms
+21:49:07.558 > FanNow=10.0% (logical curve output)
+21:49:07.559 > DutyB: now=0.75% window=0.00%..7.50% (flags: L=1 H=0 !=0 autoF=0)
+21:49:07.559 > WinFlags: impossible=0 calWarnFloorHigh=0 calWarnSpanSmall=0
+21:49:07.559 > AutoCal: state=0 valid=0 dutyB_max=-1.00 lastV=0.000 floor_mid=32.00 lift_mid=50.00 baseV=0.000 itF=0 itL=0
+21:49:07.559 > Curve T->F: 30.0->10.0, 35.0->15.0, 40.0->20.0, 45.0->30.0, 55.0->100.0
+21:49:07.559 > === END ===
+21:49:14.146 > toggle
+21:49:14.148 > Mode -> PS4
+21:50:10.970 > dump
+21:50:10.971 > === DUMP (human) ===
+21:50:10.971 > Mode: PS4  Fail:no  Sensors:2
+21:50:10.971 > Temps: hot=28.69 other=27.50  temp_fail=80.0
+21:50:10.971 > Vin: now=1.114 (min=0.600 max=1.000) cal_off=0.000 cal_gain=1.000
+21:50:10.972 > FanNode: model=0.889 meas=1.061 (win=1.044..1.180) cal_off=0.000 cal_gain=1.000
+21:50:10.972 > Dbg: VA=2.541 VB=0.047 VB_need=0.047 vnode=1.061
+21:50:10.972 > Floor=77.00%  LiftSpan=20.00%  FanMax=100.00%  Attack=200ms
+21:50:10.972 > FanNow=20.0% (logical curve output)
+21:50:10.972 > DutyB: now=1.41% window=0.00%..7.50% (flags: L=1 H=0 !=0 autoF=0)
+21:50:10.972 > WinFlags: impossible=0 calWarnFloorHigh=0 calWarnSpanSmall=0
+21:50:10.973 > AutoCal: state=0 valid=0 dutyB_max=-1.00 lastV=0.000 floor_mid=32.00 lift_mid=50.00 baseV=0.000 itF=0 itL=0
+21:50:10.973 > Curve T->F: 30.0->10.0, 35.0->15.0, 40.0->20.0, 45.0->30.0, 55.0->100.0
+21:50:10.973 > === END ===
+21:50:14.621 > history
+21:50:14.622 > [History] Most recent samples (t[s] thot vfanm duty)
+21:50:14.622 > 282 28.6 1.058 0.4
+21:50:14.622 > 283 28.6 1.060 0.0
+21:50:14.622 > 285 28.6 1.059 0.0
+21:50:14.622 > 286 28.6 1.061 0.0
+21:50:14.622 > 288 28.6 1.063 0.1
+21:50:14.623 > 289 28.6 1.057 0.0
+21:50:14.623 > 291 28.6 1.062 0.1
+21:50:14.623 > 292 28.6 1.057 0.4
+21:50:14.623 > 294 28.6 1.054 0.0
+21:50:14.623 > 295 28.6 1.059 0.0
+21:50:14.623 > 297 28.6 1.062 0.0
+21:50:14.623 > 298 28.7 1.063 0.4
+21:50:14.623 > 300 28.7 1.065 0.0
+21:50:14.624 > 301 28.7 1.060 0.0
+21:50:14.624 > 302 28.7 1.055 0.2
+21:50:14.624 > 304 28.7 1.061 0.7
+21:50:14.624 > 305 28.7 1.060 1.2
+21:50:14.624 > 307 28.7 1.066 1.3
+21:50:14.624 > 308 28.7 1.071 0.8
+21:50:14.624 > 310 28.7 1.071 1.3
+21:50:29.930 > dumpjson
+21:50:29.934 > {"mode":"ps4","fail":false,"vin_now":0.562,"vin_min_v":0.600,"vin_max_v":1.000,"fan_now":0.0,"vfan_model":0.858,"vfan_meas":1.058,"node_v_min":1.044,"node_v_max":1.180,"floor_pct":77.00,"lift_span":20.00,"fan_max":100.00,"attack_ms":200,"temp_fail":80.0,"dutyB_now":0.00,"dutyB_min_phys":0.00,"dutyB_max_phys":7.50,"win_comp_low":true,"win_comp_high":false,"win_invalid":false,"floor_auto_event":false,"cal_valid":false,"cal_dutyB_max":-1.00,"cal_baseline_v":0.000,"ac_state":0,"ac_floor_mid":32.00,"ac_lift_mid":50.00,"ac_last_v":0.000,"temp_hot":28.62,"temp_other":27.50,"ds_count":2,"cal_vin_off":0.000,"cal_vin_gain":1.000,"cal_vfan_off":0.000,"cal_vfan_gain":1.000,"win_impossible":false,"cal_warn_floor_high":false,"cal_warn_span_small":false,"cal_warn_floor_low":false,"cal_warn_overshoot":false,"window_bypass":false,"window_bypass_force":false,"raw_override":false,"dbg_VA":2.541,"dbg_VB":0.000,"dbg_VB_needed":0.000,"dbg_vnode":1.058,"model_learned":false,"model_alpha":1.000,"model_alpha_set":false,"model_pred_raw":0.858,"curve":[
+21:52:52.078 > history
+21:52:52.079 > [History] Most recent samples (t[s] thot vfanm duty)
+21:52:52.079 > 439 28.6 1.077 1.4
+21:52:52.079 > 441 28.6 1.078 1.5
+21:52:52.079 > 442 28.6 1.077 1.5
+21:52:52.080 > 444 28.6 1.077 1.5
+21:52:52.080 > 445 28.5 1.075 1.5
+21:52:52.080 > 447 28.6 1.072 1.5
+21:52:52.080 > 448 28.5 1.072 1.0
+21:52:52.080 > 450 28.5 1.071 0.7
+21:52:52.080 > 451 28.5 1.064 0.2
+21:52:52.080 > 453 28.5 1.062 0.4
+21:52:52.080 > 454 28.5 1.061 0.0
+21:52:52.081 > 456 28.6 1.062 0.0
+21:52:52.081 > 457 28.6 1.058 0.0
+21:52:52.081 > 458 28.6 1.053 0.2
+21:52:52.081 > 460 28.6 1.050 0.2
+21:52:52.081 > 461 28.6 1.054 0.7
+21:52:52.081 > 463 28.6 1.057 0.9
+21:52:52.081 > 464 28.6 1.064 1.0
+21:52:52.081 > 466 28.6 1.069 0.5
+21:52:52.081 > 467 28.6 1.071 0.7
+21:53:09.573 > dump
+21:53:09.573 > === DUMP (human) ===
+21:53:09.573 > Mode: PS4  Fail:no  Sensors:2
+21:53:09.574 > Temps: hot=28.81 other=27.50  temp_fail=80.0
+21:53:09.574 > Vin: now=0.498 (min=0.600 max=1.000) cal_off=0.000 cal_gain=1.000
+21:53:09.574 > FanNode: model=0.858 meas=1.050 (win=1.044..1.180) cal_off=0.000 cal_gain=1.000
+21:53:09.575 > Dbg: VA=2.541 VB=0.000 VB_need=0.000 vnode=1.050
+21:53:09.575 > Floor=77.00%  LiftSpan=20.00%  FanMax=100.00%  Attack=200ms
+21:53:09.575 > FanNow=0.0% (logical curve output)
+21:53:09.575 > DutyB: now=0.00% window=0.00%..7.50% (flags: L=1 H=0 !=0 autoF=0)
+21:53:09.575 > WinFlags: impossible=0 calWarnFloorHigh=0 calWarnSpanSmall=0
+21:53:09.575 > AutoCal: state=0 valid=0 dutyB_max=-1.00 lastV=0.000 floor_mid=32.00 lift_mid=50.00 baseV=0.000 itF=0 itL=0
+21:53:09.575 > Curve T->F: 30.0->10.0, 35.0->15.0, 40.0->20.0, 45.0->30.0, 55.0->100.0
+21:53:09.576 > === END ===

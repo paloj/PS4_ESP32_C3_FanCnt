@@ -4,9 +4,10 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <driver/adc.h>   // for analogSetPinAttenuation
+#include <esp_sleep.h>
 
 // -------- PINS / PWM ----------
-#define PWM_FREQ_HZ      31250
+#define PWM_FREQ_HZ      31250  // default PWM frequency (Hz)
 #define PWM_RES_BITS     10        // C3: 10-bit at 31.25 kHz works (12-bit would fail)
 #define PWM_CH_A         0
 #define PWM_CH_B         1
@@ -41,10 +42,18 @@ struct Defaults {
   float node_v_max = 1.180f;   // voltage window max
   float cal_vin_gain  = 1.000f, cal_vin_off  = 0.000f;
   float cal_vfan_gain = 1.000f, cal_vfan_off = 0.000f;
+  // Sleep defaults
+  bool  slp_en      = false;    // disabled by default until user enables
+  float slp_v       = 0.55f;    // Vin below this considered "PS4 sleeping" (after calibration)
+  float slp_tC_max  = 45.0f;    // Only sleep if hottest temp BELOW this (safety)
+  uint32_t slp_t_ms = 10000;    // dwell time (ms) that conditions must persist before deep sleep
+  uint32_t slp_w_ms = 2000;     // wake probe interval (ms) (converted to deep sleep timer)
 } D;
 
 // -------- PARAMETERS (persisted) ----------
 float vin_min_v   = D.vin_min_v;
+float pwm_freq_hz = PWM_FREQ_HZ; // runtime adjustable PWM base frequency
+static float pwm_freq_last_ok = PWM_FREQ_HZ;
 float vin_max_v   = D.vin_max_v;
 float floor_pct   = D.floor_pct;
 float lift_span   = D.lift_span;
@@ -63,18 +72,55 @@ float cal_vin_gain  = D.cal_vin_gain,  cal_vin_off  = D.cal_vin_off;
 float cal_vfan_gain = D.cal_vfan_gain, cal_vfan_off = D.cal_vfan_off;
 // test_v removed
 
+// -------- SLEEP (vin + temp based) ----------
+bool     slp_en      = D.slp_en;      // enable feature
+float    slp_v       = D.slp_v;       // vin threshold (volts)
+float    slp_tC_max  = D.slp_tC_max;  // hottest temp must be BELOW this
+uint32_t slp_t_ms    = D.slp_t_ms;    // required continuous dwell below vin & temp for sleep
+uint32_t slp_w_ms    = D.slp_w_ms;    // wake probe interval
+// Runtime tracking
+unsigned long slp_cond_start_ms = 0;  // when both conditions first satisfied (0=inactive)
+bool          slp_armed=false;        // armed status (conditions currently satisfied)
+const unsigned long SLP_BOOT_GRACE_MS = 4000; // grace after boot before evaluating sleep
+// For status / JSON
+bool slp_pending=false;              // we are currently counting down dwell
+
+
 // -------- LIVE VARS ----------
 float vin_now=0, vfan_model=0, vfan_meas=0, dutyB_now=0;
 float vin_raw=0, vfan_raw=0; // pre-filter instantaneous averages
+// Floor model instrumentation
+static float vfloor_pred=0;      // predicted vnode at current floor (VB=0) using model
+static float vnode_residual=0;   // vfan_meas - vfan_model (model error)
+static float vnode_bias_ema=0;   // slow EMA of residual (bias estimate)
+static const float VNODE_BIAS_ALPHA = 0.02f; // time constant for bias estimate
 float temp_hot=0;       // hottest DS18B20 (used for control)
 float temp_other=NAN;   // the other (display only)
 int   ds_count=0;
+// VIN diagnostics
+static float vin_min_obs=10.0f, vin_max_obs=-10.0f, vin_last_avg=0; static unsigned long vin_obs_start=0;
+static float vin_baseline=0.0f; // long-term (~10s) running average
+// Global debug verbosity (reduces serial flood when off)
+static bool debug_enabled = true; // default on for development; user can disable
+#define DBG_PRINT(fn_call) do { if(debug_enabled){ fn_call; } } while(0)
+
+// Tunable VIN filtering parameters
+static const float VIN_BASE_TC_SEC = 10.0f;   // target time constant for baseline
+static const float VIN_CLAMP_FRAC  = 0.10f;   // +/-10% clamp around baseline
+static const float VIN_MIN_BAND_V  = 0.08f;   // ensure at least this total band (to avoid collapse near 0)
+// VIN filter mode selection
+enum VinFilterMode { VIN_LEGACY=0, VIN_ROBUST=1 }; static VinFilterMode vin_filter_mode = VIN_ROBUST; // default to new robust filter
+// Diagnostics (robust mode)
+static uint8_t vin_survivors=0, vin_total_raw=0; static uint8_t vin_rail_lo_ct=0, vin_rail_hi_ct=0; static float vin_median_last=0, vin_trimmed_mean_last=0; static bool vin_baseline_upd=false, vin_unstable=false;
 bool  fan_fail=false;
+float fan_now_pct=0;              // logical fan % (0-100) after temp/PS4 curve mapping (pre physical window)
 // Debug instrumentation (live analog model values)
 float dbg_VA=0, dbg_VB=0, dbg_VB_needed=0, dbg_vnode=0; // volts (VA= floor node drive via 10k, VB = lift via 5.1k)
 // (Removed stray parser code accidentally injected into global scope)
 float dutyB_min_phys = 0.0f;       // physical lower bound for lift duty after normalization
 float dutyB_max_phys = 100.0f;     // physical upper bound (may shrink when window compressed)
+float lift_cap_pct = 7.5f;         // optional user override for physical lift max (percent 0-100, <0 disables) (default tuned to hardware)
+bool  cal_floor_lock = true;       // when true, AutoCal skips raising/lowering floor (Phase1) and preserves floor_pct
 // Compression / validity flags
 bool win_comp_low=false;   // floor alone already >= node_v_min
 bool win_comp_high=false;  // cannot reach node_v_max (VB would exceed 3.3V)
@@ -191,6 +237,8 @@ unsigned long fast_last_ms=0; const unsigned long FAST_HIST_INTERVAL_MS=100; // 
 uint8_t makeFastFlags(){
   uint8_t f=0; if(win_invalid) f|=1<<0; if(win_impossible) f|=1<<1; if(window_bypass) f|=1<<2; if(raw_override) f|=1<<3; if(cal_valid) f|=1<<4; if(win_comp_low) f|=1<<5; if(win_comp_high) f|=1<<6; if(ac_state!=AC_IDLE && ac_state!=AC_DONE && ac_state!=AC_ERROR) f|=1<<7; return f;
 }
+
+// End of file
 void recordFastSample(){
   FastSample &s = fast_hist[fast_hist_head];
   s.t_ms = millis(); s.v_meas=vfan_meas; s.v_model=vfan_model; s.v_pred_raw=vfan_pred_raw; s.dutyB=dutyB_now; s.floorPct=floor_pct; s.alpha=learn_alpha; s.flags=makeFastFlags();
@@ -202,6 +250,36 @@ uint32_t toDutyCounts(float dutyPct){
   if (dutyPct < 0) dutyPct=0;
   if (dutyPct > 100) dutyPct=100;
   return (uint32_t)roundf(dutyPct*((1<<PWM_RES_BITS)-1)/100.0f);
+}
+// Helper to apply PWM frequency safely. Returns actual frequency applied.
+static float applyPwmFrequencySafe(float req, bool verbose){
+  const float MAX_SAFE = 40000.0f; // empirically safe upper bound with 10-bit resolution
+  const float MIN_SAFE = 500.0f;   // avoid extremely low divider values
+  if(req < MIN_SAFE) req = MIN_SAFE;
+  if(req > MAX_SAFE) req = MAX_SAFE;
+  float attempt = req;
+  float aF=0, bF=0;
+  for(int tries=0; tries<6; ++tries){
+    aF = ledcSetup(PWM_CH_A, attempt, PWM_RES_BITS);
+    bF = ledcSetup(PWM_CH_B, attempt, PWM_RES_BITS);
+    if(aF > 0.0f && bF > 0.0f){
+      pwm_freq_hz = attempt; pwm_freq_last_ok = attempt;
+      ledcWrite(PWM_CH_A,toDutyCounts(floor_pct));
+      ledcWrite(PWM_CH_B,toDutyCounts(dutyB_now));
+      if(verbose && Serial) Serial.printf("[PWM] Applied %.1f Hz (A=%.1f B=%.1f)%s\n", attempt, aF, bF, (attempt!=req)?" (clamped/fallback)":"");
+      return attempt;
+    }
+    // reduce attempt frequency progressively
+    float next = attempt * 0.8f; if(next < attempt/2) next = attempt/2; if(next < MIN_SAFE) next = MIN_SAFE; attempt = next;
+  }
+  // Restore last known good frequency
+  ledcSetup(PWM_CH_A, pwm_freq_last_ok, PWM_RES_BITS);
+  ledcSetup(PWM_CH_B, pwm_freq_last_ok, PWM_RES_BITS);
+  ledcWrite(PWM_CH_A,toDutyCounts(floor_pct));
+  ledcWrite(PWM_CH_B,toDutyCounts(dutyB_now));
+  if(verbose && Serial) Serial.printf("[PWM][FAIL] Could not apply requested freq. Reverting to %.1f Hz\n", pwm_freq_last_ok);
+  pwm_freq_hz = pwm_freq_last_ok;
+  return pwm_freq_hz;
 }
 float clamp01(float x){ return x<0?0:(x>1?1:x); }
 static bool tempValid(float t){ return (t > -40 && t < 125); }
@@ -252,31 +330,95 @@ void updateControl(){
   temp_other = other;
   if (!tempValid(temp_hot)) fan_fail = true;
 
-  // --- Decide target based on mode ---
-  // Logical lift target (0-100) before voltage window normalization
-  float lift_logical = 0;
-
-  if (!use_temp_mode && !fan_fail){
-    // PS4 mode: read Vin using factory-calibrated conversion
-    // Average several samples for noise reduction
-    const int VIN_SAMPLES = 6;
-    float sumVin=0;
-    for(int i=0;i<VIN_SAMPLES;i++){ int mv_in = analogReadMilliVolts(PIN_PS4_IN); sumVin += (mv_in/1000.0f); }
-    float vin_avg = (sumVin / VIN_SAMPLES) * cal_vin_gain + cal_vin_off;
-    vin_raw = vin_avg;
-    // Exponential smoothing for stable control (time constant ~ 300 ms at 50 ms loop with alpha=0.15)
-    const float ALPHA_VIN = 0.15f;
-    vin_now = (vin_now==0?vin_avg:(vin_now + ALPHA_VIN*(vin_avg - vin_now)));
-
-  if (vin_now < 0.05f || vin_now > 3.30f) fan_fail = true;
-
-  float norm = clamp01((vin_now - vin_min_v) / (vin_max_v - vin_min_v));
-    lift_logical  = lift_span * norm;
-    if (lift_logical > fan_max) lift_logical = fan_max; // fan_max acts as logical cap pre-normalization
+  // --- Always sample PS4 analog VIN (needed for sleep detection even in temp mode) ---
+  {
+    if(vin_filter_mode==VIN_LEGACY){
+      // Legacy: simple 12-sample average with min/max discard + baseline clamp
+      const int N=12; int mv[N]; long sum=0; int minv=10000, maxv=-1; int minIdx=-1, maxIdx=-1;
+      for(int i=0;i<N;i++){ int v=analogReadMilliVolts(PIN_PS4_IN); mv[i]=v; sum+=v; if(v<minv){minv=v; minIdx=i;} if(v>maxv){maxv=v; maxIdx=i;} }
+      if(minIdx>=0) sum-=minv; if(maxIdx>=0 && maxIdx!=minIdx) sum-=maxv; // remove extremes
+      int denom = N - ((minIdx>=0)?1:0) - ((maxIdx>=0 && maxIdx!=minIdx)?1:0); if(denom<1) denom=N;
+      float vin_avg_raw = ((sum/(float)denom)/1000.0f) * cal_vin_gain + cal_vin_off;
+      unsigned long now_ms = millis(); static unsigned long last_base_ms=0; if(last_base_ms==0) last_base_ms=now_ms; unsigned long dt = now_ms - last_base_ms; if(dt>5000) dt=5000;
+      if(vin_baseline==0.0f){ vin_baseline = vin_avg_raw; } else { float alpha_long = (VIN_BASE_TC_SEC>0)? (dt / (VIN_BASE_TC_SEC*1000.0f)) : 1.0f; if(alpha_long>0.25f) alpha_long=0.25f; if(alpha_long<0) alpha_long=0; vin_baseline += alpha_long * (vin_avg_raw - vin_baseline); }
+      last_base_ms = now_ms;
+      float band_low = vin_baseline * (1.0f - VIN_CLAMP_FRAC);
+      float band_high= vin_baseline * (1.0f + VIN_CLAMP_FRAC);
+      float band_width = band_high - band_low; if(band_width < VIN_MIN_BAND_V){ float mid = vin_baseline; band_low = mid - VIN_MIN_BAND_V*0.5f; band_high = mid + VIN_MIN_BAND_V*0.5f; if(band_low<0) band_low=0; }
+      float vin_avg = vin_avg_raw; if(vin_avg < band_low) vin_avg = band_low; else if(vin_avg > band_high) vin_avg = band_high;
+      vin_raw = vin_avg; const float ALPHA_VIN = 0.20f; vin_now = (vin_now==0?vin_avg:(vin_now + ALPHA_VIN*(vin_avg - vin_now)));
+      if(!vin_obs_start) vin_obs_start=millis(); if(millis()-vin_obs_start>1000){ if(vin_avg<vin_min_obs) vin_min_obs=vin_avg; if(vin_avg>vin_max_obs) vin_max_obs=vin_avg; }
+      vin_last_avg = vin_avg; static unsigned long _lastVinDbg=0; unsigned long _nowDbg=millis();
+  if(_nowDbg - _lastVinDbg > 6000){ int mv_probe = analogReadMilliVolts(PIN_PS4_IN); DBG_PRINT( if(Serial) Serial.printf("[VIN-DBG] LEG probe=%dmV avgRaw=%.3f base=%.3f avg=%.3f now=%.3f band=(%.3f..%.3f) min=%.3f max=%.3f\n", mv_probe, vin_avg_raw, vin_baseline, vin_avg, vin_now, band_low, band_high, vin_min_obs, vin_max_obs) ); _lastVinDbg=_nowDbg; }
+    } else {
+      // Robust filter: median + adaptive trimmed mean + guarded baseline & asymmetric clamp
+      const int N=21; int mv[N]; vin_total_raw=N; vin_rail_lo_ct=0; vin_rail_hi_ct=0;
+      for(int i=0;i<N;i++){ int v=analogReadMilliVolts(PIN_PS4_IN); mv[i]=v; if(v<30) vin_rail_lo_ct++; else if(v>3200) vin_rail_hi_ct++; }
+      // sort (simple insertion for small N)
+      for(int i=1;i<N;i++){ int key=mv[i]; int j=i-1; while(j>=0 && mv[j]>key){ mv[j+1]=mv[j]; j--; } mv[j+1]=key; }
+      int median_mv = mv[N/2];
+      vin_median_last = median_mv/1000.0f * cal_vin_gain + cal_vin_off;
+      int thr = median_mv/4; if(thr < 80) thr = 80; // dynamic +/- threshold in mV
+      int min_need = (int)(N*0.6f);
+      int survivors_sum=0; int survivors_ct=0; long survivors_sq=0; // for variance
+      for(int i=0;i<N;i++){
+        if(abs(mv[i]-median_mv) <= thr){ survivors_sum += mv[i]; survivors_ct++; }
+      }
+      if(survivors_ct < min_need){
+        // relax threshold (single step)
+        thr = (int)(thr*1.8f);
+        survivors_sum=0; survivors_ct=0; for(int i=0;i<N;i++){ if(abs(mv[i]-median_mv) <= thr){ survivors_sum+=mv[i]; survivors_ct++; } }
+      }
+      vin_survivors = survivors_ct;
+      vin_unstable = (survivors_ct < min_need/2);
+      float trimmed_mean_mv = (survivors_ct>0)? (survivors_sum/(float)survivors_ct) : (float)median_mv;
+      for(int i=0;i<N;i++){ if(abs(mv[i]-median_mv) <= thr){ float d = mv[i]-trimmed_mean_mv; survivors_sq += (long)(d*d); } }
+      float variance_mv2 = (survivors_ct>1)? (survivors_sq/(float)(survivors_ct-1)) : 0.0f;
+      float stddev_mv = sqrtf(variance_mv2);
+      vin_trimmed_mean_last = trimmed_mean_mv/1000.0f * cal_vin_gain + cal_vin_off;
+      float vin_avg_raw = vin_trimmed_mean_last; // already scaled to volts via gain/off
+      unsigned long now_ms = millis(); static unsigned long last_base_ms=0; if(last_base_ms==0) last_base_ms=now_ms; unsigned long dt = now_ms - last_base_ms; if(dt>5000) dt=5000;
+      vin_baseline_upd=false;
+      if(vin_baseline==0.0f){ vin_baseline=vin_avg_raw; vin_baseline_upd=true; }
+      else if(!vin_unstable){
+        // Guard: large variance OR huge jump -> slower update
+        bool noisy = (stddev_mv > 260); // ~0.26V stddev threshold
+        float diff = vin_avg_raw - vin_baseline;
+        float alpha_long = (VIN_BASE_TC_SEC>0)? (dt / (VIN_BASE_TC_SEC*1000.0f)) : 1.0f; if(alpha_long>0.25f) alpha_long=0.25f; if(alpha_long<0) alpha_long=0;
+        if(diff < -0.15f){ // allow faster downward correction if baseline inflated
+          float alpha_down = 0.40f; vin_baseline += alpha_down * diff; vin_baseline_upd=true; }
+        else if(!noisy){ vin_baseline += alpha_long * diff; vin_baseline_upd=true; }
+      }
+      last_base_ms = now_ms;
+      // Asymmetric clamp: tighter upward (VIN_CLAMP_FRAC) but allow 2x downward excursion before clamp
+      float up_frac = VIN_CLAMP_FRAC;
+      float down_frac = VIN_CLAMP_FRAC*2.0f;
+      float band_low = vin_baseline * (1.0f - down_frac);
+      float band_high= vin_baseline * (1.0f + up_frac);
+      float band_width = band_high - band_low; if(band_width < VIN_MIN_BAND_V){ float mid=vin_baseline; band_low = mid - VIN_MIN_BAND_V*0.5f; band_high = mid + VIN_MIN_BAND_V*0.5f; if(band_low<0) band_low=0; }
+      float vin_avg = vin_avg_raw; if(vin_avg < band_low) vin_avg = band_low; else if(vin_avg > band_high) vin_avg = band_high;
+      vin_raw = vin_avg_raw; // expose unclamped raw (trimmed) for diagnostics
+      const float ALPHA_VIN = 0.30f; vin_now = (vin_now==0?vin_avg:(vin_now + ALPHA_VIN*(vin_avg - vin_now)));
+      if(!vin_obs_start) vin_obs_start=millis(); if(millis()-vin_obs_start>1000){ if(vin_avg<vin_min_obs) vin_min_obs=vin_avg; if(vin_avg>vin_max_obs) vin_max_obs=vin_avg; }
+      vin_last_avg = vin_avg;
+      static unsigned long _lastVinDbg=0; unsigned long _nowDbg=millis();
+  if(_nowDbg - _lastVinDbg > 6000){ int mv_probe = analogReadMilliVolts(PIN_PS4_IN); DBG_PRINT( if(Serial) Serial.printf("[VIN-DBG] ROB probe=%dmV med=%.3f trim=%.3f base=%.3f now=%.3f surv=%u/%u rails(L/H)=%u/%u band=(%.3f..%.3f) upd=%d noisy=%d std=%.0fmV unstable=%d\n", mv_probe, vin_median_last, vin_trimmed_mean_last, vin_baseline, vin_now, vin_survivors, vin_total_raw, vin_rail_lo_ct, vin_rail_hi_ct, band_low, band_high, vin_baseline_upd?1:0, (stddev_mv>260)?1:0, stddev_mv, vin_unstable?1:0) ); _lastVinDbg=_nowDbg; }
+    }
   }
-  else if (!fan_fail){
-    // Temp mode: use hottest sensor
-    lift_logical = interpCurve(temp_hot); // Curve already 0-100 logical
+
+  // Flag absurd readings (retain previous behavior influencing failsafe)
+  if (vin_now < 0.00f || vin_now > 3.30f) fan_fail = true; // allow 0 exactly (console off) without triggering fan_fail
+
+  // --- Decide logical lift target (0-100) based on current mode ---
+  float lift_logical = 0;
+  if(!fan_fail){
+    if(!use_temp_mode){
+      float norm = clamp01((vin_now - vin_min_v) / (vin_max_v - vin_min_v));
+      lift_logical = lift_span * norm;
+      if (lift_logical > fan_max) lift_logical = fan_max;
+    } else {
+      lift_logical = interpCurve(temp_hot); // temp curve already 0-100
+    }
   }
 
   // Failsafe: over temperature → full fan
@@ -300,17 +442,19 @@ void updateControl(){
       vfan_pred_raw = (VA_raw/R_A + VB_raw/R_B) / (1.0f/R_A + 1.0f/R_B);
       vfan_model = vfan_pred_raw;
     }
+    // Instrument predicted floor voltage (VB=0 case)
+    vfloor_pred = v_bias + (model_learned ? (wA_eff*VA_raw) : ( (VA_raw/R_A)/( (1.0f/R_A)+(1.0f/R_B) ) ));
     // Sample fan node for display (reuse measurement block from later but simplified)
     const int VFAN_SAMPLES_RAW = 4;
     float sumF=0; for(int i=0;i<VFAN_SAMPLES_RAW;i++){ int mv_fb = analogReadMilliVolts(PIN_FAN_FB); sumF += (mv_fb/1000.0f); }
     float vfan_avg = (sumF / VFAN_SAMPLES_RAW) * cal_vfan_gain + cal_vfan_off;
     vfan_raw = vfan_avg; const float ALPHA_VFAN = 0.30f; // quicker while in raw
     vfan_meas = (vfan_meas==0?vfan_avg:(vfan_meas + ALPHA_VFAN*(vfan_avg - vfan_meas)));
+  vnode_residual = vfan_meas - vfan_model; vnode_bias_ema = (vnode_bias_ema==0? vnode_residual : (vnode_bias_ema + VNODE_BIAS_ALPHA*(vnode_residual - vnode_bias_ema)));
     // Instrumentation reflect raw
     dbg_VA = VA_raw; dbg_VB = VB_raw; dbg_vnode = vfan_meas; dbg_VB_needed = VB_raw;
     // Throttled debug print for raw override visibility
-    if(Serial){ static unsigned long lastRawLog=0; unsigned long now=millis(); if(now-lastRawLog>350){
-        Serial.printf("[RAW] A=%.1f%% B=%.1f%% vnode=%.3fV pred=%.3f\n", raw_dutyA, raw_dutyB, vfan_meas, vfan_pred_raw); lastRawLog=now; } }
+  if(Serial){ static unsigned long lastRawLog=0; unsigned long now=millis(); if(now-lastRawLog>350){ DBG_PRINT( Serial.printf("[RAW] A=%.1f%% B=%.1f%% vnode=%.3fV pred=%.3f\n", raw_dutyA, raw_dutyB, vfan_meas, vfan_pred_raw) ); lastRawLog=now; } }
     // History log rate preserved below at loop level
     return;
   }
@@ -373,6 +517,11 @@ void updateControl(){
     dutyB_max_phys = cal_dutyB_max; // trust measured upper bound
     if(dutyB_max_phys < dutyB_min_phys) dutyB_max_phys = dutyB_min_phys;
   }
+  // Apply user lift cap override last (strongest) if enabled
+  if(lift_cap_pct >= 0.0f){
+    if(lift_cap_pct < dutyB_min_phys) dutyB_max_phys = dutyB_min_phys; // degenerate span
+    else if(lift_cap_pct < dutyB_max_phys) dutyB_max_phys = lift_cap_pct;
+  }
   // Validate calibrated span: if too narrow (<2% duty) treat calibration as invalid
   if(cal_valid && !window_bypass && (dutyB_max_phys - dutyB_min_phys) < 2.0f){
     cal_warn_span_small = true; cal_valid = false; // ignore override
@@ -382,9 +531,11 @@ void updateControl(){
   if (dutyB_max_phys <= dutyB_min_phys){
     // Collapsed window → any logical value maps to min
     dutyB_tgt_phys = dutyB_min_phys;
+    fan_now_pct = clamp01(lift_logical/100.0f)*100.0f; // still report underlying logical percent
   } else {
     float normL = clamp01(lift_logical/100.0f);
     dutyB_tgt_phys = dutyB_min_phys + (dutyB_max_phys - dutyB_min_phys)*normL;
+    fan_now_pct = normL*100.0f;
   }
 
   // Overshoot feedback clamp: if measured node already above max+margin, pull target down gradually
@@ -427,6 +578,14 @@ void updateControl(){
     vfan_pred_raw = (VA/R_A + VB/R_B) / (1.0f/R_A + 1.0f/R_B);
     vfan_model = vfan_pred_raw;
   }
+  // Predicted floor (VB=0) for current floor_pct
+  float VA_floor = VA; // VA from current floor
+  if(model_learned){
+    vfloor_pred = v_bias + wA_eff*VA_floor; // ignore lift term
+  } else {
+    // For simple resistor blend, VB=0 predicted node with only VA contribution:
+    vfloor_pred = (VA_floor/R_A) / ((1.0f/R_A)+(1.0f/R_B));
+  }
 
   // Measure fan node via GPIO3 feedback (factory-calibrated path then trimmed)
   {
@@ -437,6 +596,7 @@ void updateControl(){
     vfan_raw = vfan_avg;
     const float ALPHA_VFAN = 0.18f; // slightly quicker tracking
     vfan_meas = (vfan_meas==0?vfan_avg:(vfan_meas + ALPHA_VFAN*(vfan_avg - vfan_meas)));
+  vnode_residual = vfan_meas - vfan_model; vnode_bias_ema = (vnode_bias_ema==0? vnode_residual : (vnode_bias_ema + VNODE_BIAS_ALPHA*(vnode_residual - vnode_bias_ema)));
   }
 
   // -------- Auto-Calibration State Machine (overrides outputs while active) --------
@@ -477,8 +637,8 @@ void updateControl(){
           float a=s1,b=s2,c=s3; // manual median
           if(a>b) std::swap(a,b); if(b>c) std::swap(b,c); if(a>b) std::swap(a,b);
           if(Serial && ac_iter_floor==0){
-            if(!ac_baseline_retry) Serial.printf("[AutoCal] Baseline samples: %.3f %.3f %.3f median=%.3f\n", s1,s2,s3,b);
-            else Serial.printf("[AutoCal] Baseline RETRY samples: %.3f %.3f %.3f median=%.3f\n", s1,s2,s3,b);
+        if(!ac_baseline_retry) DBG_PRINT( Serial.printf("[AutoCal] Baseline samples: %.3f %.3f %.3f median=%.3f\n", s1,s2,s3,b) );
+          else DBG_PRINT( Serial.printf("[AutoCal] Baseline RETRY samples: %.3f %.3f %.3f median=%.3f\n", s1,s2,s3,b) );
           }
           return b; };
         ac_last_v = sampleMedian3();
@@ -494,7 +654,7 @@ void updateControl(){
                 // One retry: maybe residual charge from prior high floor. Force extra wait and sample again.
                 ac_baseline_retry=true; ac_step_time=now; // re-enter WAIT with added fixed delay
                 ac_extra_settle_ms = 400; // fixed second settle window
-                Serial.println("[AutoCal] Baseline high on first sample -> retry after extra settle");
+                DBG_PRINT( Serial.println("[AutoCal] Baseline high on first sample -> retry after extra settle") );
                 ac_state=AC_P1_WAIT; break; }
               // Second time still high: treat as impossible
               win_impossible = true; cal_valid=false; cal_dutyB_max=-1; ac_error_msg = "baseline>node_v_max"; ac_state = AC_ERROR; break; }
@@ -562,7 +722,7 @@ void updateControl(){
     if(Serial){
       static AutoCalState lastLogged=AC_IDLE; static unsigned long lastLogMs=0;
       if(ac_state!=lastLogged && millis()-lastLogMs>40){
-        Serial.printf("[AutoCal] state=%d floor_mid=%.2f lift_mid=%.2f v=%.3f itF=%d itL=%d\n", (int)ac_state, ac_floor_mid, ac_lift_mid, ac_last_v, ac_iter_floor, ac_iter_lift);
+  DBG_PRINT( Serial.printf("[AutoCal] state=%d floor_mid=%.2f lift_mid=%.2f v=%.3f itF=%d itL=%d\n", (int)ac_state, ac_floor_mid, ac_lift_mid, ac_last_v, ac_iter_floor, ac_iter_lift) );
         lastLogged=ac_state; lastLogMs=millis();
       }
   if(ac_state==AC_VALIDATE){ Serial.printf("[AutoCal] VALIDATE hold floor=%.2f dutyB=%.2f ref=%.3f\n", floor_pct, cal_dutyB_max, ac_validate_ref_v); }
@@ -708,7 +868,7 @@ String htmlPage(){
   h+="<div class='control-group' data-for='floor_pct'>";
   h+="<button class='lock-btn' id='toggle_floor_pct' onclick=\"toggleEdit('floor_pct')\">Edit</button>";
   h+="<label for='floor_pct'>Floor (%):</label>";
-  h+="<input disabled type='range' id='floor_pct' class='slider' min='20' max='40' step='0.1' value='"+String(floor_pct,1)+"' oninput='updateDisplay(\"floor_pct\", this.value, 1);'>";
+  h+="<input disabled type='range' id='floor_pct' class='slider' min='0' max='100' step='0.1' value='"+String(floor_pct,1)+"' oninput='updateDisplay(\"floor_pct\", this.value, 1);'>";
   h+="<span class='value-display' id='floor_pct_val'>"+String(floor_pct,1)+"</span>";
   h+="<button disabled class='reset-btn' id='reset_floor_pct' onclick=\"resetParam('floor_pct')\">↺</button>";
   h+="</div>";
@@ -748,7 +908,7 @@ String htmlPage(){
   h+="<div class='control-group'>";
   h+="<button class='lock-btn' id='toggle_attack_ms' onclick=\"toggleEdit('attack_ms')\">Edit</button>";
   h+="<label for='attack_ms'>Attack (ms):</label>";
-  h+="<input disabled type='range' id='attack_ms' class='slider' min='50' max='2000' step='10' value='"+String(attack_ms,0)+"' oninput='updateDisplay(\"attack_ms\", this.value, 0);'>";
+  h+="<input disabled type='range' id='attack_ms' class='slider' min='50' max='30000' step='10' value='"+String(attack_ms,0)+"' oninput='updateDisplay(\"attack_ms\", this.value, 0);'>";
   h+="<span class='value-display' id='attack_ms_val'>"+String(attack_ms,0)+"</span>";
   h+="<button disabled class='reset-btn' id='reset_attack_ms' onclick=\"resetParam('attack_ms')\">↺</button>";
   h+="</div>";
@@ -877,7 +1037,7 @@ String htmlPage(){
   h+="function toggleMode(){xhrText('/toggle',function(){});}";
   h+="function factoryReset(){if(!confirm('Erase and reboot?'))return;xhrText('/factory',function(){alert('Rebooting...');setTimeout(function(){location.reload();},1500);});}";
   h+="function startAutoCal(){xhrText('/autocal',function(err,res){if(err){alert('AutoCal error: '+err);return;}alert('AutoCal start: '+res);});}";
-  h+="function drawChart(c,xs,ys,col,yMin,yMax,yl,stats){var ctx=c.getContext('2d');var W=c.width=c.clientWidth,H=c.height=c.clientHeight;ctx.clearRect(0,0,W,H);ctx.fillStyle='#fff';ctx.fillRect(0,0,W,H);var L=50,R=8,T=8,B=22,w=W-L-R,h=H-T-B;ctx.strokeStyle='#eee';ctx.lineWidth=1;ctx.beginPath();for(var g=0;g<=4;g++){var y=T+h*g/4;ctx.moveTo(L,y);ctx.lineTo(W-R,y);}ctx.stroke();ctx.fillStyle='#444';ctx.font='11px sans-serif';for(var g=0;g<=4;g++){var val=yMax-(yMax-yMin)*g/4;var y=T+h*g/4+4;ctx.fillText(val.toFixed( (Math.abs(yMax-yMin)<5)?2:1 ),5,y);}ctx.strokeStyle='#222';ctx.beginPath();ctx.moveTo(L,T);ctx.lineTo(L,H-B);ctx.lineTo(W-R,H-B);ctx.stroke();ctx.fillStyle='#000';ctx.font='12px sans-serif';ctx.fillText(yl,5,12);if(xs.length<2)return;var x0=xs[0],x1=xs[xs.length-1];function X(x){return L+(x-x0)/( (x1-x0)||1 )*w;}function Y(y){return T+(1-(y-yMin)/( (yMax-yMin)||1 ))*h;}ctx.strokeStyle=col;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(X(xs[0]),Y(ys[0]));for(var i=1;i<xs.length;i++)ctx.lineTo(X(xs[i]),Y(ys[i]));ctx.stroke();if(stats){ctx.fillStyle='rgba(0,0,0,0.65)';ctx.font='10px monospace';var txt='min '+stats.min.toFixed(stats.dp)+'  max '+stats.max.toFixed(stats.dp)+'  cur '+stats.cur.toFixed(stats.dp)+'  avg '+stats.avg.toFixed(stats.dp);var tw=ctx.measureText(txt).width+8;var th=14;ctx.fillRect(W-tw-4,T+2,tw,th);ctx.fillStyle='#fff';ctx.fillText(txt,W-tw, T+12);} }";
+  h+="function drawChart(c,xs,ys,col,yMin,yMax,yl,stats){var ctx=c.getContext('2d');var W=c.width=c.clientWidth,H=c.height=c.clientHeight;ctx.clearRect(0,0,W,H);ctx.fillStyle='#fff';ctx.fillRect(0,0,W,H);var L=50,R=8,T=18,B=22,w=W-L-R,h=H-T-B;ctx.strokeStyle='#eee';ctx.lineWidth=1;ctx.beginPath();for(var g=0;g<=4;g++){var y=T+h*g/4;ctx.moveTo(L,y);ctx.lineTo(W-R,y);}ctx.stroke();ctx.fillStyle='#444';ctx.font='11px sans-serif';for(var g=0;g<=4;g++){var val=yMax-(yMax-yMin)*g/4;var y=T+h*g/4+4;ctx.fillText(val.toFixed( (Math.abs(yMax-yMin)<5)?2:1 ),5,y);}ctx.strokeStyle='#222';ctx.beginPath();ctx.moveTo(L,T);ctx.lineTo(L,H-B);ctx.lineTo(W-R,H-B);ctx.stroke();ctx.fillStyle='#000';ctx.font='12px sans-serif';ctx.fillText(yl,5,T-6);if(xs.length<2)return;var x0=xs[0],x1=xs[xs.length-1];function X(x){return L+(x-x0)/( (x1-x0)||1 )*w;}function Y(y){return T+(1-(y-yMin)/( (yMax-yMin)||1 ))*h;}ctx.strokeStyle=col;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(X(xs[0]),Y(ys[0]));for(var i=1;i<xs.length;i++)ctx.lineTo(X(xs[i]),Y(ys[i]));ctx.stroke();if(stats){ctx.fillStyle='rgba(0,0,0,0.65)';ctx.font='10px monospace';var txt='min '+stats.min.toFixed(stats.dp)+'  max '+stats.max.toFixed(stats.dp)+'  cur '+stats.cur.toFixed(stats.dp)+'  avg '+stats.avg.toFixed(stats.dp);var tw=ctx.measureText(txt).width+8;var th=14;ctx.fillRect(W-tw-4,T+2,tw,th);ctx.fillStyle='#fff';ctx.fillText(txt,W-tw, T+12);} }";
   h+="function arrMin(a,def){if(a.length==0)return def;var m=a[0];for(var i=1;i<a.length;i++)if(a[i]<m)m=a[i];return Math.min(m,def);}function arrMax(a,def){if(a.length==0)return def;var m=a[0];for(var i=1;i<a.length;i++)if(a[i]>m)m=a[i];return Math.max(m,def);}";
   h+="function statObj(a){var n=a.length;var mn=a[0],mx=a[0],sum=0;for(var i=0;i<n;i++){var v=a[i];if(v<mn)mn=v;if(v>mx)mx=v;sum+=v;}return {min:mn,max:mx,cur:a[n-1],avg:sum/n,dp:(Math.abs(mx-mn)<5?2:1)};}";
   h+="function renderCharts(){xhrJSON('/history',function(err,a){if(err||!a||a.length<2)return;var xs=[],temps=[],duty=[],vfm=[];for(var i=0;i<a.length;i++){xs.push(a[i].t);temps.push(a[i].thot);duty.push(a[i].duty);vfm.push(a[i].vfanm);}var tmin=arrMin(temps,30),tmax=arrMax(temps,90);drawChart(document.getElementById('cTemp'),xs,temps,'#c00',tmin,tmax,'°C',statObj(temps));drawChart(document.getElementById('cFan'),xs,duty,'#06c',0,100,'Lift %',statObj(duty));var vmin=arrMin(vfm,0.8),vmax=arrMax(vfm,1.3);drawChart(document.getElementById('cVfan'),xs,vfm,'#090',vmin,vmax,'Vfan',statObj(vfm));});}";
@@ -995,10 +1155,10 @@ void handleSet(){
     }
   }
 
-  floor_pct = sane(floor_pct, 0.0f, 60.0f, D.floor_pct);
+  floor_pct = sane(floor_pct, 0.0f, 100.0f, D.floor_pct);
   lift_span = sane(lift_span, 0.0f,  60.0f, D.lift_span);
   fan_max   = sane(fan_max,   10.0f, 100.0f, D.fan_max);
-  attack_ms = sane(attack_ms, 20.0f, 4000.0f, D.attack_ms);
+  attack_ms = sane(attack_ms, 20.0f, 30000.0f, D.attack_ms);
   temp_fail = sane(temp_fail, 50.0f, 100.0f, D.temp_fail);
   node_v_min = sane(node_v_min, 0.80f, 1.50f, D.node_v_min);
   node_v_max = sane(node_v_max, 0.85f, 1.70f, D.node_v_max);
@@ -1077,6 +1237,7 @@ void handleJson(){
   j+="\"vfan\":"+String(vfan_model,3)+",";
   j+="\"vfanm\":"+String(vfan_meas,3)+",";
   j+="\"dutyB\":"+String(dutyB_now,1)+",";
+  j+="\"fan_now\":"+String(fan_now_pct,1)+","; // logical 0-100% from curve
   // Normalization diagnostics
   j+="\"dutyB_min\":"+String(dutyB_min_phys,1)+",";
   j+="\"dutyB_max\":"+String(dutyB_max_phys,1)+",";
@@ -1089,6 +1250,8 @@ void handleJson(){
   j+="\"ac_valid\":"+String(cal_valid?"true":"false")+",";
   j+="\"ac_duty_max\":"+String(cal_dutyB_max,1)+",";
   j+="\"cal_baseline_v\":"+String(cal_baseline_v,3)+",";
+  j+="\"lift_cap_pct\":"+String(lift_cap_pct,1)+","; // -1 means disabled
+  j+="\"cal_floor_lock\":"+String(cal_floor_lock?"true":"false")+",";
   j+="\"curve_ok\":" + String(curve_ok?"true":"false") + ","; // flag for UI to decide retry/fallback
   if (tempValid(temp_hot))   j+="\"temp0\":"+String(temp_hot,1)+","; else j+="\"temp0\":null,";
   if (tempValid(temp_other)) j+="\"temp1\":"+String(temp_other,1)+","; else j+="\"temp1\":null,";
@@ -1105,10 +1268,22 @@ void handleJson(){
   j+="\"window_bypass\":" + String(window_bypass?"true":"false") + ",";
   j+="\"window_bypass_force\":" + String(window_bypass_force?"true":"false") + ",";
   j+="\"raw_override\":" + String(raw_override?"true":"false") + ",";
+  // Sleep feature status
+  j+="\"slp_en\":" + String(slp_en?"true":"false") + ",";
+  j+="\"slp_v\":" + String(slp_v,3) + ",";
+  j+="\"slp_tC_max\":" + String(slp_tC_max,1) + ",";
+  j+="\"slp_t_ms\":" + String((unsigned long)slp_t_ms) + ",";
+  j+="\"slp_w_ms\":" + String((unsigned long)slp_w_ms) + ",";
+  j+="\"slp_pending\":" + String(slp_pending?"true":"false") + ",";
+  if(slp_pending){ unsigned long remain = 0; if(slp_cond_start_ms>0){ unsigned long el = millis() - slp_cond_start_ms; if(el < slp_t_ms) remain = slp_t_ms - el; }
+    j+="\"slp_remain_ms\":" + String(remain) + ","; }
   if(raw_override){ j+="\"raw_dutyA\":"+String(raw_dutyA,1)+","; j+="\"raw_dutyB\":"+String(raw_dutyB,1)+","; }
   j+="\"model_learned\":" + String(model_learned?"true":"false") + ",";
   j+="\"v_bias\":" + String(v_bias,3) + ",";
   j+="\"wA_eff\":" + String(wA_eff,4) + ",";
+  j+="\"vfloor_pred\":" + String(vfloor_pred,3) + ",";
+  j+="\"vnode_residual\":" + String(vnode_residual,3) + ",";
+  j+="\"vnode_bias\":" + String(vnode_bias_ema,3) + ",";
   j+="\"wB_eff\":" + String(wB_eff,4) + ",";
   j+="\"model_alpha\":" + String(learn_alpha,3) + ",";
   j+="\"model_alpha_set\":" + String(learn_alpha_set?"true":"false") + ",";
@@ -1189,8 +1364,14 @@ void handleAutoCal(){
   if(ac_state!=AC_IDLE && ac_state!=AC_DONE && ac_state!=AC_ERROR){ server.send(200,"text/plain","Already running"); return; }
   // Ensure raw override is disabled so calibration sees real baseline
   if(raw_override){ raw_override=false; raw_dutyA=0; raw_dutyB=0; if(Serial) Serial.println("[AutoCal] Clearing raw_override before start"); }
-  ac_state = AC_P1_SET; cal_valid=false; cal_dutyB_max=-1; ac_error_msg=""; ac_step_time=millis();
-  if(Serial){ Serial.printf("[AutoCal] START  node_v_min=%.3f node_v_max=%.3f floor_pct=%.2f dutyB_now=%.2f\n", node_v_min, node_v_max, floor_pct, dutyB_now); }
+  cal_valid=false; cal_dutyB_max=-1; ac_error_msg=""; ac_step_time=millis();
+  if(cal_floor_lock){
+    ac_state = AC_P2_SET; // skip floor search
+    if(Serial){ Serial.printf("[AutoCal] START (floor-lock) floor=%.2f node_v_min=%.3f node_v_max=%.3f dutyB_now=%.2f\n", floor_pct, node_v_min, node_v_max, dutyB_now); }
+  } else {
+    ac_state = AC_P1_SET;
+    if(Serial){ Serial.printf("[AutoCal] START node_v_min=%.3f node_v_max=%.3f floor_start=%.2f dutyB_now=%.2f\n", node_v_min, node_v_max, floor_pct, dutyB_now); }
+  }
   server.send(200,"text/plain","Started");
 }
 
@@ -1217,7 +1398,7 @@ void setup(){
   analogSetPinAttenuation(PIN_PS4_IN, ADC_11db);  // 0..~3.3 V
   analogSetPinAttenuation(PIN_FAN_FB, ADC_11db);
 
-  // PWM
+  // PWM (initial default; may be reconfigured after loading prefs)
   float fA = ledcSetup(PWM_CH_A, PWM_FREQ_HZ, PWM_RES_BITS);
   float fB = ledcSetup(PWM_CH_B, PWM_FREQ_HZ, PWM_RES_BITS);
   ledcAttachPin(PIN_PWM_A, PWM_CH_A);
@@ -1237,6 +1418,7 @@ void setup(){
   bool have_node_min = prefs.isKey("node_v_min");
   vin_min_v=prefs.getFloat("vin_min_v",vin_min_v);
   vin_max_v=prefs.getFloat("vin_max_v",vin_max_v);
+  pwm_freq_hz = prefs.getFloat("pwm_hz", pwm_freq_hz);
   floor_pct=prefs.getFloat("floor_pct",floor_pct);
   lift_span=prefs.getFloat("lift_span",lift_span);
   fan_max=prefs.getFloat("fan_max",fan_max);
@@ -1256,13 +1438,35 @@ void setup(){
   v_bias        = prefs.getFloat("v_bias", v_bias);
   wA_eff        = prefs.getFloat("wA_eff", wA_eff);
   wB_eff        = prefs.getFloat("wB_eff", wB_eff);
-  cal_baseline_meas = prefs.getFloat("cal_baseline_meas", cal_baseline_meas);
+  // Baseline measurement key migration: old key "cal_baseline_meas" (>15 chars) caused KEY_TOO_LONG error.
+  // New shorter key: "cb_meas". Load new key first; if absent, try old, then persist under new key.
+  if(prefs.isKey("cb_meas")){
+    cal_baseline_meas = prefs.getFloat("cb_meas", cal_baseline_meas);
+  } else if(prefs.isKey("cal_baseline_meas")){
+    cal_baseline_meas = prefs.getFloat("cal_baseline_meas", cal_baseline_meas);
+    // Write migrated value to new key (ignore failure silently)
+    Preferences p2; p2.begin("fan", false); p2.putFloat("cb_meas", cal_baseline_meas); p2.end();
+    Serial.printf("[BOOT] Migrated baseline key to cb_meas (%.3fV)\n", cal_baseline_meas);
+  }
+  lift_cap_pct = prefs.getFloat("lift_cap_pct", lift_cap_pct);
+  cal_floor_lock = prefs.getBool("cal_floor_lock", cal_floor_lock);
   model_learned = prefs.getBool("model_learned", model_learned);
   learn_alpha   = prefs.getFloat("learn_alpha", learn_alpha);
+  // Sleep feature keys (backward compatible; use defaults if absent)
+  slp_en      = prefs.getBool("slp_en", slp_en);
+  slp_v       = prefs.getFloat("slp_v", slp_v);
+  slp_tC_max  = prefs.getFloat("slp_tC_max", slp_tC_max);
+  slp_t_ms    = prefs.getUInt("slp_t_ms", slp_t_ms);
+  slp_w_ms    = prefs.getUInt("slp_w_ms", slp_w_ms);
   if(learn_alpha < 0.1f || learn_alpha > 1.2f) learn_alpha = 1.0f; // sanity
   learn_alpha_last_saved = learn_alpha;
   learn_alpha_frozen = prefs.getBool("alpha_frozen", false);
   prefs.end();
+  // Re-apply PWM frequency if different from compile-time default
+  auto applyPwmFreq=[&](){
+    applyPwmFrequencySafe(pwm_freq_hz, true);
+  };
+  if(fabs(pwm_freq_hz - PWM_FREQ_HZ) > 1.0f){ applyPwmFreq(); }
 
   // If factory reset (no keys) ensure updated defaults applied & optionally persist once so subsequent boots stable
   if(!have_floor){
@@ -1285,6 +1489,14 @@ void setup(){
     prefs.begin("fan", false);
     if(!have_floor) prefs.putFloat("floor_pct", floor_pct);
     if(!have_node_min){ prefs.putFloat("node_v_min", node_v_min); prefs.putFloat("node_v_max", node_v_max); }
+    // Persist sleep defaults on first-run so UI / serial shows stable values
+    if(!prefs.isKey("slp_en")){
+      prefs.putBool("slp_en", slp_en);
+      prefs.putFloat("slp_v", slp_v);
+      prefs.putFloat("slp_tC_max", slp_tC_max);
+      prefs.putUInt("slp_t_ms", slp_t_ms);
+      prefs.putUInt("slp_w_ms", slp_w_ms);
+    }
     prefs.end();
     Serial.println("[BOOT] Persisted updated defaults (first-run or post-factory)");
   }
@@ -1316,6 +1528,22 @@ void setup(){
 
 void loop(){
   server.handleClient();
+  // --- dump follow mode state ---
+  static bool dump_follow=false; // active continuous dump (multi-line / ANSI)
+  static bool dump_follow_screen_cleared=false; // whether initial clear done
+  static bool dump_follow_single=false; // single-line CR mode (no ANSI)
+  static unsigned long dump_follow_last=0;
+  const unsigned long DUMP_FOLLOW_INTERVAL_MS = 500; // refresh cadence
+  // If in follow mode and any key arrives, cancel follow (consume single char and newline the display)
+  if((dump_follow||dump_follow_single) && Serial && Serial.available()){
+    Serial.read(); // consume one char (could flush more, but one is enough to signal)
+    if(dump_follow_single){
+      Serial.print("\n[dump-follow-single] stopped\n");
+    } else {
+      Serial.print("\033[0m\n[dump-follow] stopped\n");
+    }
+    dump_follow=false; dump_follow_single=false; dump_follow_screen_cleared=false;
+  }
   // --- Simple Serial Command Parser ---
   // Commands:
   //   dump      -> human readable multi-line snapshot
@@ -1348,22 +1576,41 @@ void loop(){
         idx=0;
         cmd.trim();
         if(cmd.length()==0) continue; // ignore empty line
-        if(cmd.equalsIgnoreCase("dump") || cmd.equalsIgnoreCase("d")){
-          Serial.println("=== DUMP (human) ===");
+        if(cmd.equalsIgnoreCase("dump") || cmd.equalsIgnoreCase("d") || cmd.startsWith("dump ")){
+          bool follow=false;
+          bool followSingle=false;
+          if(cmd.length()>4){ String arg = cmd.substring(4); arg.trim(); if(arg.equalsIgnoreCase("f")||arg.equalsIgnoreCase("follow")) follow=true; }
+          if(cmd.length()>4){ String arg = cmd.substring(4); arg.trim(); if(arg.equalsIgnoreCase("fs")||arg.equalsIgnoreCase("follow1")||arg.equalsIgnoreCase("followline")) followSingle=true; }
+          if(follow){
+            dump_follow=true; dump_follow_last=0; // force immediate refresh below
+            dump_follow_screen_cleared=false; // will clear on first refresh
+            Serial.println("[dump-follow] starting (non-scrolling) press any key to stop");
+          }
+          if(followSingle){
+            dump_follow_single=true; dump_follow_last=0; Serial.println("[dump-follow-single] starting (single line) press any key to stop");
+          }
+          if(!dump_follow) Serial.println("=== DUMP (human) ===");
           Serial.printf("Mode: %s  Fail:%s  Sensors:%d\n", use_temp_mode?"TEMP":"PS4", fan_fail?"YES":"no", ds_count);
           Serial.printf("Temps: hot=%.2f other=%s  temp_fail=%.1f\n", temp_hot, tempValid(temp_other)?String(temp_other,2).c_str():"n/a", temp_fail);
-          Serial.printf("Vin: now=%.3f (min=%.3f max=%.3f) cal_off=%.3f cal_gain=%.3f\n", vin_now, vin_min_v, vin_max_v, cal_vin_off, cal_vin_gain);
-            Serial.printf("FanNode: model=%.3f meas=%.3f (win=%.3f..%.3f) cal_off=%.3f cal_gain=%.3f\n", vfan_model, vfan_meas, node_v_min, node_v_max, cal_vfan_off, cal_vfan_gain);
-            Serial.printf("Dbg: VA=%.3f VB=%.3f VB_need=%.3f vnode=%.3f\n", dbg_VA, dbg_VB, dbg_VB_needed, dbg_vnode);
-          Serial.printf("Floor=%.2f%%  LiftSpan=%.2f%%  FanMax=%.2f%%  Attack=%.0fms\n", floor_pct, lift_span, fan_max, attack_ms);
+          if(vin_filter_mode==VIN_ROBUST){
+            Serial.printf("Vin: now=%.3f (min=%.3f max=%.3f) med=%.3f trim=%.3f base=%.3f surv=%u/%u rails=%u/%u mode=ROB%s cal_off=%.3f cal_gain=%.3f\n", vin_now, vin_min_v, vin_max_v, vin_median_last, vin_trimmed_mean_last, vin_baseline, vin_survivors, vin_total_raw, vin_rail_lo_ct, vin_rail_hi_ct, vin_unstable?"*":"", cal_vin_off, cal_vin_gain);
+          } else {
+            Serial.printf("Vin: now=%.3f (min=%.3f max=%.3f) base=%.3f mode=LEG cal_off=%.3f cal_gain=%.3f\n", vin_now, vin_min_v, vin_max_v, vin_baseline, cal_vin_off, cal_vin_gain);
+          }
+          Serial.printf("FanNode: model=%.3f meas=%.3f (win=%.3f..%.3f) cal_off=%.3f cal_gain=%.3f\n", vfan_model, vfan_meas, node_v_min, node_v_max, cal_vfan_off, cal_vfan_gain);
+          Serial.printf("Dbg: VA=%.3f VB=%.3f VB_need=%.3f vnode=%.3f\n", dbg_VA, dbg_VB, dbg_VB_needed, dbg_vnode);
+          Serial.printf("Floor=%.2f%%  LiftSpan=%.2f%%  FanMax=%.2f%%  Attack=%.0fms  PWM=%.1fHz\n", floor_pct, lift_span, fan_max, attack_ms, pwm_freq_hz);
+          Serial.printf("FanNow=%.1f%% (logical curve output)\n", fan_now_pct);
           Serial.printf("DutyB: now=%.2f%% window=%.2f%%..%.2f%% (flags: L=%d H=%d !=%d autoF=%d)\n", dutyB_now, dutyB_min_phys, dutyB_max_phys, win_comp_low, win_comp_high, win_invalid, floor_auto_event);
           Serial.printf("WinFlags: impossible=%d calWarnFloorHigh=%d calWarnSpanSmall=%d\n", win_impossible, cal_warn_floor_high, cal_warn_span_small);
+          Serial.printf("Sleep: en=%d vin_thr=%.3fV tC_max=%.1f dwell=%lums wake_int=%lums pending=%d\n", slp_en?1:0, slp_v, slp_tC_max, (unsigned long)slp_t_ms, (unsigned long)slp_w_ms, slp_pending?1:0);
           Serial.printf("AutoCal: state=%d valid=%d dutyB_max=%.2f lastV=%.3f floor_mid=%.2f lift_mid=%.2f baseV=%.3f itF=%d itL=%d\n", (int)ac_state, cal_valid, cal_dutyB_max, ac_last_v, ac_floor_mid, ac_lift_mid, cal_baseline_v, ac_iter_floor, ac_iter_lift);
           Serial.print("Curve T->F: ");
           for(int i=0;i<5;i++){ Serial.printf("%.1f->%.1f%s", temp_pt[i], fan_pt[i], (i<4)?", ":"\n"); }
-          Serial.println("=== END ===");
+          if(!dump_follow) Serial.println("=== END ===");
+          dump_follow_last = millis();
         } else if(cmd.equalsIgnoreCase("help") || cmd.equalsIgnoreCase("h")){
-          Serial.println("Commands: dump(d) dumpjson(dj) save ac acstop calreset calinject floor= dutyB= acstop alphafreeze [val] alphafreeclear raw [off|a= b=] bypass [on|off] set key=val learn history fh fasthist factory reboot restart toggle calreset calreset help");
+          Serial.println("Commands: dump(d) dump f|follow dumpjson(dj) save ac acstop calreset calinject floor= dutyB= alphafreeze [val] alphafreeclear raw [off|a= b=] bypass [on|off] set key=val pwmfreq [Hz] vinraw vinmode [robust|legacy] learn history fh fasthist factory reboot restart toggle help");
         } else if(cmd.equalsIgnoreCase("dumpjson") || cmd.equalsIgnoreCase("dj")){
           // produce single-line JSON for machine ingest
           String j="{";
@@ -1372,6 +1619,7 @@ void loop(){
           j+="\"vin_now\":"+String(vin_now,3)+",";
           j+="\"vin_min_v\":"+String(vin_min_v,3)+",";
           j+="\"vin_max_v\":"+String(vin_max_v,3)+",";
+          j+="\"fan_now\":"+String(fan_now_pct,1)+",";
           j+="\"vfan_model\":"+String(vfan_model,3)+",";
           j+="\"vfan_meas\":"+String(vfan_meas,3)+",";
           j+="\"node_v_min\":"+String(node_v_min,3)+",";
@@ -1419,6 +1667,7 @@ void loop(){
           j+="\"model_alpha\":"+String(learn_alpha,3)+",";
           j+="\"model_alpha_set\":"+String(learn_alpha_set?"true":"false")+",";
           j+="\"model_pred_raw\":"+String(vfan_pred_raw,3)+",";
+          j+="\"pwm_hz\":"+String(pwm_freq_hz,1)+",";
           j+="\"curve\":[";
           for(int i=0;i<5;i++){ j+="["+String(temp_pt[i],1)+","+String(fan_pt[i],1)+"]"; if(i<4) j+=","; }
           j+="]}";
@@ -1429,11 +1678,11 @@ void loop(){
           Serial.println("[Cal] Calibration cleared");
         } else if(cmd.equalsIgnoreCase("ac")){
           if(ac_state==AC_IDLE || ac_state==AC_DONE || ac_state==AC_ERROR){
-            if(raw_override){ raw_override=false; raw_dutyA=0; raw_dutyB=0; Serial.println("[AutoCal] Clearing raw_override (serial trigger)"); }
+            if(raw_override){ raw_override=false; raw_dutyA=0; raw_dutyB=0; DBG_PRINT( Serial.println("[AutoCal] Clearing raw_override (serial trigger)"); ); }
             ac_state = AC_P1_SET; cal_valid=false; cal_dutyB_max=-1; ac_error_msg=""; ac_step_time=millis();
-            Serial.println("[AutoCal] Triggered via serial");
+            DBG_PRINT( Serial.println("[AutoCal] Triggered via serial"); );
           } else {
-            Serial.println("[AutoCal] Already running");
+            DBG_PRINT( Serial.println("[AutoCal] Already running"); );
           }
   } else if(cmd.startsWith("calinject")){
           // Usage: calinject floor=<pct> dutyB=<pct>
@@ -1453,12 +1702,12 @@ void loop(){
           String line = lastRawLine; int sp = line.indexOf(' '); if(sp>0){ String v=line.substring(sp+1); v.trim(); if(v.length()){ float val=v.toFloat(); if(val>=0.1f && val<=1.2f) learn_alpha=val; }}
           learn_alpha_frozen=true; learn_alpha_set=true;
           prefs.begin("fan", false); prefs.putFloat("learn_alpha", learn_alpha); prefs.putBool("alpha_frozen", true); prefs.end();
-          Serial.printf("[ALPHA] Frozen at %.3f\n", learn_alpha);
+          DBG_PRINT( Serial.printf("[ALPHA] Frozen at %.3f\n", learn_alpha); );
         } else if(cmd.equalsIgnoreCase("alphafreeclear")){
-          learn_alpha_frozen=false; prefs.begin("fan", false); prefs.putBool("alpha_frozen", false); prefs.end(); Serial.println("[ALPHA] Freeze cleared (adaptation resumes)");
+          learn_alpha_frozen=false; prefs.begin("fan", false); prefs.putBool("alpha_frozen", false); prefs.end(); DBG_PRINT( Serial.println("[ALPHA] Freeze cleared (adaptation resumes)"); );
         } else if(cmd.equalsIgnoreCase("acstop")){
-          if(ac_state!=AC_IDLE){ ac_state=AC_IDLE; Serial.println("[AutoCal] Stopped"); }
-          else Serial.println("[AutoCal] Not running");
+          if(ac_state!=AC_IDLE){ ac_state=AC_IDLE; DBG_PRINT( Serial.println("[AutoCal] Stopped"); ); }
+          else DBG_PRINT( Serial.println("[AutoCal] Not running"); );
         } else if(cmd.equalsIgnoreCase("toggle")){
           use_temp_mode = !use_temp_mode; prefs.begin("fan",false); prefs.putBool("mode",use_temp_mode); prefs.end();
           Serial.printf("Mode -> %s\n", use_temp_mode?"TEMP":"PS4");
@@ -1478,13 +1727,21 @@ void loop(){
           prefs.putFloat("lift_span",lift_span);
           prefs.putFloat("fan_max",fan_max);
           prefs.putFloat("attack_ms",attack_ms);
-            prefs.putFloat("temp_fail",temp_fail);
+          prefs.putFloat("temp_fail",temp_fail);
           prefs.putFloat("node_v_min",node_v_min);
           prefs.putFloat("node_v_max",node_v_max);
           prefs.putFloat("cal_vin_off",cal_vin_off);
           prefs.putFloat("cal_vin_gain",cal_vin_gain);
           prefs.putFloat("cal_vfan_off",cal_vfan_off);
           prefs.putFloat("cal_vfan_gain",cal_vfan_gain);
+          prefs.putFloat("pwm_hz", pwm_freq_hz);
+          prefs.putFloat("lift_cap_pct", lift_cap_pct);
+          prefs.putBool("cal_floor_lock", cal_floor_lock);
+          prefs.putBool("slp_en", slp_en);
+          prefs.putFloat("slp_v", slp_v);
+          prefs.putFloat("slp_tC_max", slp_tC_max);
+          prefs.putUInt("slp_t_ms", slp_t_ms);
+          prefs.putUInt("slp_w_ms", slp_w_ms);
           for(int i=0;i<5;i++){ prefs.putFloat(("t"+String(i)).c_str(),temp_pt[i]); prefs.putFloat(("f"+String(i)).c_str(),fan_pt[i]); }
           prefs.putBool("mode", use_temp_mode);
           // Calibration & learned model (if available)
@@ -1498,6 +1755,40 @@ void loop(){
           prefs.end();
           floor_auto_event=false; // considered acknowledged
           Serial.println("[SAVE] OK (config+cal+model persisted)");
+        } else if(cmd.startsWith("pwmfreq")){
+          // pwmfreq            -> show current
+          // pwmfreq <Hz>       -> change runtime PWM frequency (500..40000 safe)  (attempts fallback if too high)
+          String rest = lastRawLine.substring(String("pwmfreq").length()); rest.trim();
+          if(rest.length()==0){ Serial.printf("[PWM] freq=%.1f Hz\n", pwm_freq_hz); }
+          else {
+            float f = rest.toFloat();
+            if(f<=0){ Serial.println("[PWM] invalid"); }
+            else {
+              float old=pwm_freq_hz; applyPwmFrequencySafe(f, true);
+              Serial.printf("[PWM] Request %.1f -> Now %.1f Hz\n", old, pwm_freq_hz);
+            }
+          }
+        } else if(cmd.equalsIgnoreCase("vinraw")){
+          const int N=40; int mv[N]; for(int i=0;i<N;i++){ mv[i]=analogReadMilliVolts(PIN_PS4_IN); delay(2); }
+          int minv=mv[0], maxv=mv[0]; long sum=0; for(int i=0;i<N;i++){ if(mv[i]<minv) minv=mv[i]; if(mv[i]>maxv) maxv=mv[i]; sum+=mv[i]; }
+          int tmp[N]; for(int i=0;i<N;i++) tmp[i]=mv[i];
+          for(int i=1;i<N;i++){ int key=tmp[i]; int k=i-1; while(k>=0 && tmp[k]>key){ tmp[k+1]=tmp[k]; k--; } tmp[k+1]=key; }
+          float mean = sum/(float)N; float median = (N%2)? tmp[N/2] : 0.5f*(tmp[N/2-1]+tmp[N/2]);
+          Serial.printf("[VINRAW] mV:"); for(int i=0;i<N;i++){ Serial.printf(" %d", mv[i]); } Serial.println();
+          Serial.printf("[VINRAW] min=%d max=%d mean=%.1f median=%.1f vin_now=%.3f gain=%.3f off=%.3f span=(%.3f..%.3f) mode=%s\n", minv, maxv, mean, median, vin_now, cal_vin_gain, cal_vin_off, vin_min_v, vin_max_v, vin_filter_mode==VIN_ROBUST?"ROB":"LEG");
+          Serial.flush();
+        } else if(cmd.startsWith("vinmode")){
+          String rest = cmd.substring(7); rest.trim();
+          if(rest.length()==0){ Serial.printf("[VINMODE] %s\n", vin_filter_mode==VIN_ROBUST?"robust":"legacy"); }
+          else if(rest.equalsIgnoreCase("robust")){ vin_filter_mode=VIN_ROBUST; Serial.println("[VINMODE] -> robust"); }
+          else if(rest.equalsIgnoreCase("legacy")){ vin_filter_mode=VIN_LEGACY; Serial.println("[VINMODE] -> legacy"); }
+          else Serial.println("Usage: vinmode [robust|legacy]");
+        } else if(cmd.startsWith("debug")){
+          String rest = cmd.substring(5); rest.trim();
+          if(rest.length()==0){ Serial.printf("[DEBUG] %s\n", debug_enabled?"on":"off"); }
+          else if(rest.equalsIgnoreCase("on")){ debug_enabled=true; Serial.println("[DEBUG] -> on"); }
+          else if(rest.equalsIgnoreCase("off")){ debug_enabled=false; Serial.println("[DEBUG] -> off"); }
+          else Serial.println("Usage: debug [on|off]");
         } else if(cmd.equalsIgnoreCase("history")){
           Serial.println("[History] Most recent samples (t[s] thot vfanm duty)");
           int n=hist_count; int shown = n<20?n:20; // last up to 20
@@ -1582,6 +1873,16 @@ void loop(){
               else if(key=="cal_vin_gain"){ cal_vin_gain = sane(val,0.80f,1.20f,D.cal_vin_gain); }
               else if(key=="cal_vfan_off"){ cal_vfan_off = sane(val,-0.50f,0.50f,D.cal_vfan_off); }
               else if(key=="cal_vfan_gain"){ cal_vfan_gain = sane(val,0.80f,1.20f,D.cal_vfan_gain); }
+              else if(key=="pwm_hz"){ float req=val; float old=pwm_freq_hz; applyPwmFrequencySafe(req, true); Serial.printf("[PWM] set requested=%.1f actual=%.1f Hz\n", req, pwm_freq_hz); }
+              else if(key=="lift_cap_pct"){ // -1 disables
+                if(val < 0) lift_cap_pct = -1.0f; else lift_cap_pct = sane(val,0.0f,100.0f, -1.0f);
+              }
+              else if(key=="cal_floor_lock"){ if(valStr.equalsIgnoreCase("on")||valStr=="1") cal_floor_lock=true; else if(valStr.equalsIgnoreCase("off")||valStr=="0") cal_floor_lock=false; else ok=false; }
+              else if(key=="slp_en"){ if(valStr.equalsIgnoreCase("on")||valStr=="1") slp_en=true; else if(valStr.equalsIgnoreCase("off")||valStr=="0") slp_en=false; else ok=false; }
+              else if(key=="slp_v"){ slp_v = sane(val,0.30f,1.20f,D.slp_v); }
+              else if(key=="slp_tC_max"){ slp_tC_max = sane(val,5.0f,90.0f,D.slp_tC_max); }
+              else if(key=="slp_t_ms"){ if(val<1000) val=1000; if(val>600000) val=600000; slp_t_ms = (uint32_t)val; }
+              else if(key=="slp_w_ms"){ if(val<500) val=500; if(val>600000) val=600000; slp_w_ms = (uint32_t)val; }
               else if(key.startsWith("t") && key.length()==2 && isdigit(key[1])){ int i=key[1]-'0'; if(i>=0 && i<5){ temp_pt[i]=val; curveChanged=true; } else ok=false; }
               else if(key.startsWith("f") && key.length()==2 && isdigit(key[1])){ int i=key[1]-'0'; if(i>=0 && i<5){ fan_pt[i]=val; curveChanged=true; } else ok=false; }
               else if(key=="mode"){ if(valStr.equalsIgnoreCase("temp")||valStr=="1"){ use_temp_mode=true; } else if(valStr.equalsIgnoreCase("ps4")||valStr=="0"){ use_temp_mode=false; } else ok=false; }
@@ -1606,6 +1907,14 @@ void loop(){
             prefs.putFloat("cal_vin_gain",cal_vin_gain);
             prefs.putFloat("cal_vfan_off",cal_vfan_off);
             prefs.putFloat("cal_vfan_gain",cal_vfan_gain);
+            prefs.putFloat("pwm_hz", pwm_freq_hz);
+            prefs.putFloat("lift_cap_pct", lift_cap_pct);
+            prefs.putBool("cal_floor_lock", cal_floor_lock);
+            prefs.putBool("slp_en", slp_en);
+            prefs.putFloat("slp_v", slp_v);
+            prefs.putFloat("slp_tC_max", slp_tC_max);
+            prefs.putUInt("slp_t_ms", slp_t_ms);
+            prefs.putUInt("slp_w_ms", slp_w_ms);
             for(int i=0;i<5;i++){ prefs.putFloat(("t"+String(i)).c_str(),temp_pt[i]); prefs.putFloat(("f"+String(i)).c_str(),fan_pt[i]); }
             prefs.putBool("mode", use_temp_mode);
             // Calibration invalidated already if those keys touched; persist its flags
@@ -1615,16 +1924,16 @@ void loop(){
             Serial.printf("Set applied=%d rejected=%d curveChanged=%d\n", applied, rejected, curveChanged?1:0);
           }
   } else if(cmd.equalsIgnoreCase("learn")){
-          if(raw_override){ Serial.println("[LEARN] Cannot start: raw override active"); }
-          else if(ac_state!=AC_IDLE){ Serial.println("[LEARN] Cannot start: AutoCal running"); }
-          else if(learn_state!=L_IDLE && learn_state!=L_DONE){ Serial.println("[LEARN] Already in progress"); }
+          if(raw_override){ DBG_PRINT( Serial.println("[LEARN] Cannot start: raw override active"); ); }
+          else if(ac_state!=AC_IDLE){ DBG_PRINT( Serial.println("[LEARN] Cannot start: AutoCal running"); ); }
+          else if(learn_state!=L_IDLE && learn_state!=L_DONE){ DBG_PRINT( Serial.println("[LEARN] Already in progress"); ); }
           else {
             // Initialize sequence
             learn_state = L_RUN_A; learn_step=0; raw_override=true; raw_dutyB=0; raw_dutyA=LEARN_SEQ_A[0];
             ledcWrite(PWM_CH_A, toDutyCounts(raw_dutyA));
             ledcWrite(PWM_CH_B, toDutyCounts(0));
             learn_step_start = millis();
-            Serial.println("[LEARN] Starting characterization (A sequence)...");
+            DBG_PRINT( Serial.println("[LEARN] Starting characterization (A sequence)..."); );
           }
         } else {
           Serial.print("Unknown: "); Serial.println(cmd);
@@ -1633,8 +1942,8 @@ void loop(){
       } else if(isPrintable(c)){
         if(idx < sizeof(cmdBuf)-1){ cmdBuf[idx++]=c; if(Serial) Serial.print(c); }
       }
-    }
-  }
+    } // end while(Serial.available())
+  } // end if(Serial && Serial.available())
   if (millis()-lastUpdate > 50){
       // Boot-time automatic baseline capture: measure vnode with lift fully off (dutyB=0) at configured floor
       // Conditions to attempt: feature pending, not already active, no calibration running, no raw override, calibration invalid OR no prior measurement
@@ -1668,7 +1977,7 @@ void loop(){
           // Decide compression
           if(cal_baseline_meas >= node_v_min - COMP_MEAS_HYST){ win_comp_low = true; }
           // Persist measurement for future boots
-          prefs.begin("fan", false); prefs.putFloat("cal_baseline_meas", cal_baseline_meas); prefs.end();
+          prefs.begin("fan", false); prefs.putFloat("cb_meas", cal_baseline_meas); prefs.end();
           Serial.printf("[BOOT] Baseline captured: %.3fV (comp_low=%d)\n", cal_baseline_meas, win_comp_low?1:0);
           boot_baseline_active=false; boot_baseline_pending=false;
         }
@@ -1694,9 +2003,9 @@ void loop(){
           learn_state = L_RUN_B; learn_step=0; raw_dutyA=0; raw_dutyB=LEARN_SEQ_B[0];
           ledcWrite(PWM_CH_A, toDutyCounts(raw_dutyA));
           ledcWrite(PWM_CH_B, toDutyCounts(raw_dutyB));
-          learn_step_start = now; Serial.println("[LEARN] A sequence complete -> B sequence");
+          learn_step_start = now; DBG_PRINT( Serial.println("[LEARN] A sequence complete -> B sequence"); );
         } else if(learn_state==L_RUN_B && learn_step >= (int)(sizeof(LEARN_SEQ_B)/sizeof(float))){
-          learn_state = L_COMPUTE; Serial.println("[LEARN] Data collection done; computing...");
+          learn_state = L_COMPUTE; DBG_PRINT( Serial.println("[LEARN] Data collection done; computing..."); );
         } else {
           if(learn_state==L_RUN_A){ raw_dutyA=LEARN_SEQ_A[learn_step]; raw_dutyB=0; }
           else { raw_dutyA=0; raw_dutyB=LEARN_SEQ_B[learn_step]; }
@@ -1713,7 +2022,7 @@ void loop(){
       regress(LEARN_SEQ_B, learn_vals_B, nB, bB, wBcalc);
       v_bias=(bA+bB)/2.0f; wA_eff=wAcalc; wB_eff=wBcalc;
       bool ok=true;
-      auto fail=[&](const char* msg){ Serial.print("[LEARN][REJECT] "); Serial.println(msg); ok=false; };
+  auto fail=[&](const char* msg){ DBG_PRINT( Serial.print("[LEARN][REJECT] "); Serial.println(msg); ); ok=false; };
       if(!(v_bias>0.05f && v_bias<2.5f)) fail("v_bias outside plausible range (0.05-2.5V)");
       if(!(wA_eff>0.0f)) fail("wA <= 0");
       if(!(wB_eff>0.0f)) fail("wB <= 0");
@@ -1723,11 +2032,10 @@ void loop(){
       if(ok){
         model_learned=true; learn_state=L_DONE; raw_override=false;
         prefs.begin("fan", false); prefs.putFloat("v_bias", v_bias); prefs.putFloat("wA_eff", wA_eff); prefs.putFloat("wB_eff", wB_eff); prefs.putBool("model_learned", true); prefs.end();
-        Serial.printf("[LEARN] ACCEPT v_bias=%.3f wA=%.4f wB=%.4f (bA=%.3f bB=%.3f)\n", v_bias, wA_eff, wB_eff, bA, bB);
-        Serial.println("[LEARN] Completed. Future mapping now bias-aware.");
+  DBG_PRINT( Serial.printf("[LEARN] ACCEPT v_bias=%.3f wA=%.4f wB=%.4f (bA=%.3f bB=%.3f)\n", v_bias, wA_eff, wB_eff, bA, bB); Serial.println("[LEARN] Completed. Future mapping now bias-aware."); );
       } else {
         // Revert to previous (do not alter persisted values); mark done but not learned
-        model_learned=false; learn_state=L_DONE; raw_override=false; Serial.println("[LEARN] Model rejected; keeping previous parameters.");
+  model_learned=false; learn_state=L_DONE; raw_override=false; DBG_PRINT( Serial.println("[LEARN] Model rejected; keeping previous parameters."); );
       }
     }
     // Learn command processing (trigger)
@@ -1826,6 +2134,75 @@ void loop(){
       lastFloorPersist = millis();
     }
     lastUpdate = millis();
+  }
+  // Periodic refresh for dump follow mode (after main control updates so values are fresh)
+  if(dump_follow_single){
+    unsigned long now = millis();
+    if(now - dump_follow_last >= DUMP_FOLLOW_INTERVAL_MS){
+      // Build compact status line and overwrite
+      Serial.print('\r');
+      char buf[160];
+      snprintf(buf,sizeof(buf),
+        "Hot=%.2fC Fan=%.1f%% VB=%.2f%% Floor=%.2f%% Vin=%.3f PWM=%.0fHz Node=%.3fV DutyWin=[%.2f..%.2f]    ",
+        tempValid(temp_hot)?temp_hot:-99.0f, fan_now_pct, dutyB_now, floor_pct, vin_now, pwm_freq_hz, vfan_meas, dutyB_min_phys, dutyB_max_phys);
+      Serial.print(buf);
+      dump_follow_last=now;
+    }
+  }
+  if(dump_follow){
+    unsigned long now = millis();
+    if(!dump_follow_screen_cleared){
+      Serial.print("\033[2J\033[H"); // clear screen & home
+      dump_follow_screen_cleared=true;
+    }
+    if(now - dump_follow_last >= DUMP_FOLLOW_INTERVAL_MS){
+      // Move cursor home each frame
+      Serial.print("\033[H");
+      // For each line, clear it then print
+      auto clrLine=[](){ Serial.print("\033[2K"); };
+      clrLine(); Serial.print("=== DUMP (follow) ===\n");
+      clrLine(); Serial.printf("Mode: %s  Fail:%s  Sensors:%d\n", use_temp_mode?"TEMP":"PS4", fan_fail?"YES":"no", ds_count);
+      clrLine(); Serial.printf("Temps: hot=%.2f other=%s  temp_fail=%.1f\n", temp_hot, tempValid(temp_other)?String(temp_other,2).c_str():"n/a", temp_fail);
+      clrLine(); Serial.printf("Vin: now=%.3f (min=%.3f max=%.3f) cal_off=%.3f cal_gain=%.3f\n", vin_now, vin_min_v, vin_max_v, cal_vin_off, cal_vin_gain);
+      clrLine(); Serial.printf("FanNode: model=%.3f meas=%.3f (win=%.3f..%.3f) cal_off=%.3f cal_gain=%.3f\n", vfan_model, vfan_meas, node_v_min, node_v_max, cal_vfan_off, cal_vfan_gain);
+      clrLine(); Serial.printf("Dbg: VA=%.3f VB=%.3f VB_need=%.3f vnode=%.3f\n", dbg_VA, dbg_VB, dbg_VB_needed, dbg_vnode);
+      clrLine(); Serial.printf("Floor=%.2f%%  LiftSpan=%.2f%%  FanMax=%.2f%%  Attack=%.0fms  PWM=%.1fHz\n", floor_pct, lift_span, fan_max, attack_ms, pwm_freq_hz);
+      clrLine(); Serial.printf("FanNow=%.1f%% (logical curve output)\n", fan_now_pct);
+      clrLine(); Serial.printf("DutyB: now=%.2f%% window=%.2f%%..%.2f%% (flags: L=%d H=%d !=%d autoF=%d)\n", dutyB_now, dutyB_min_phys, dutyB_max_phys, win_comp_low, win_comp_high, win_invalid, floor_auto_event);
+      clrLine(); Serial.printf("WinFlags: impossible=%d calWarnFloorHigh=%d calWarnSpanSmall=%d\n", win_impossible, cal_warn_floor_high, cal_warn_span_small);
+      clrLine(); Serial.printf("Sleep: en=%d vin_thr=%.3fV tC_max=%.1f dwell=%lums wake_int=%lums pending=%d\n", slp_en?1:0, slp_v, slp_tC_max, (unsigned long)slp_t_ms, (unsigned long)slp_w_ms, slp_pending?1:0);
+      clrLine(); Serial.printf("AutoCal: state=%d valid=%d dutyB_max=%.2f lastV=%.3f floor_mid=%.2f lift_mid=%.2f baseV=%.3f itF=%d itL=%d\n", (int)ac_state, cal_valid, cal_dutyB_max, ac_last_v, ac_floor_mid, ac_lift_mid, cal_baseline_v, ac_iter_floor, ac_iter_lift);
+      clrLine(); Serial.print("Curve T->F: "); for(int i=0;i<5;i++){ Serial.printf("%.1f->%.1f%s", temp_pt[i], fan_pt[i], (i<4)?", ":"\n"); }
+      clrLine(); Serial.print("(press any key to exit follow)\n");
+      dump_follow_last = now;
+    }
+  }
+  // ---- Sleep condition evaluation (after control & adaptation) ----
+  if(slp_en && (millis() > SLP_BOOT_GRACE_MS) && !raw_override && ac_state==AC_IDLE && !fan_fail){
+    bool temp_ok = tempValid(temp_hot) ? (temp_hot < slp_tC_max) : false; // require valid temp
+    bool vin_ok  = (!use_temp_mode) ? (vin_now>0 && vin_now < slp_v) : false; // only consider vin while in PS4 mode
+    bool cond = (temp_ok && vin_ok);
+    if(cond){
+      if(!slp_armed){ slp_armed=true; slp_cond_start_ms = millis(); }
+      unsigned long dwell = millis() - slp_cond_start_ms;
+      slp_pending = true;
+      if(dwell >= slp_t_ms){
+        // Enter deep sleep. Configure timer wake.
+        if(Serial){ Serial.printf("[SLEEP] Entering deep sleep (vin=%.3f < %.3f, temp=%.1f < %.1f) for %lums\n", vin_now, slp_v, temp_hot, slp_tC_max, (unsigned long)slp_w_ms); Serial.flush(); }
+        // Prepare minimal state (nothing special right now). Stop WiFi to reduce current.
+        WiFi.mode(WIFI_OFF);
+        esp_sleep_enable_timer_wakeup( (uint64_t)slp_w_ms * 1000ULL );
+        // Put PWMs to safe state (floor still applied; acceptable). Optionally could disable.
+        delay(50);
+        esp_deep_sleep_start();
+      }
+    } else {
+      // reset tracking
+      slp_armed=false; slp_cond_start_ms=0; slp_pending=false;
+    }
+  } else {
+    // Feature disabled or conditions suppressed
+    slp_armed=false; slp_cond_start_ms=0; slp_pending=false;
   }
   // (Heartbeat removed to reduce serial noise)
 }
