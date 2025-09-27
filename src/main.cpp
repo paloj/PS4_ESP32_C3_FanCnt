@@ -19,7 +19,6 @@
 // Wi-Fi AP
 const char* ssid = "PS4FAN-CTRL";
 const char* password = "12345678";
-
 WebServer server(80);
 Preferences prefs;
 
@@ -41,7 +40,6 @@ struct Defaults {
   // ADC calibration defaults (centered in slider ranges)
   float cal_vin_gain  = 1.000f, cal_vin_off  = 0.000f;   // gain: 0.8-1.2, off: -0.5 to +0.5
   float cal_vfan_gain = 1.000f, cal_vfan_off = 0.000f;
-  float test_v = 0.900f; // default for debug slider
 } D;
 
 // -------- PARAMETERS (persisted) ----------
@@ -60,7 +58,7 @@ float fan_pt [5] = {D.fan_pt [0],D.fan_pt [1],D.fan_pt [2],D.fan_pt [3],D.fan_pt
 // ADC calibration (UI sliders)
 float cal_vin_gain  = D.cal_vin_gain,  cal_vin_off  = D.cal_vin_off;
 float cal_vfan_gain = D.cal_vfan_gain, cal_vfan_off = D.cal_vfan_off;
-float test_v = D.test_v; // ensure global accessible
+// test_v removed
 
 // -------- LIVE VARS ----------
 float vin_now=0, vfan_model=0, vfan_meas=0, dutyB_now=0;
@@ -209,27 +207,21 @@ String htmlPage(){
 
   h+="<div class='section'>";
   h+="<h3>Live Status</h3>";
-  h+="<p>Vin=<span id='vin'>?</span> V • ";
-  h+="Fan node (model)=<span id='vfan'>?</span> V • ";
-  h+="Fan node (meas)=<span id='vfanm'>?</span> V • ";
-  h+="PWM_B=<span id='dutyB'>?</span> %<br>";
-  h+="Temp HOT=<span id='temp0'>?</span> °C • ";
-  h+="Temp OTHER=<span id='temp1'>—</span> °C • ";
-  h+="Sensors=<span id='dscount'>0</span><br>";
-  h+="Mode=<span id='mode'>?</span> • ";
-  h+="Fail=<span id='fail'>?</span></p>";
+  h+="<table style='width:100%;font-size:13px;border-collapse:collapse'>";
+  h+="<tr><th style='text-align:left'>Signal</th><th>Value</th><th style='text-align:left'>Notes</th></tr>";
+  h+="<tr><td>Vin (PS4 in)</td><td><span id='vin'>?</span> V</td><td>Mapped between Vin Min/Max</td></tr>";
+  h+="<tr><td>Fan Node (model)</td><td><span id='vfan'>?</span> V</td><td>Resistor network prediction</td></tr>";
+  h+="<tr><td>Fan Node (meas)</td><td><span id='vfanm'>?</span> V</td><td>ADC feedback</td></tr>";
+  h+="<tr><td>Lift PWM</td><td><span id='dutyB'>?</span> %</td><td>After slew limiting</td></tr>";
+  h+="<tr><td>Temp HOT</td><td><span id='temp0'>?</span> °C</td><td>Highest valid sensor</td></tr>";
+  h+="<tr><td>Temp OTHER</td><td><span id='temp1'>—</span> °C</td><td>Second sensor (if any)</td></tr>";
+  h+="<tr><td>Sensors</td><td><span id='dscount'>0</span></td><td>Detected DS18B20 count</td></tr>";
+  h+="<tr><td>Mode</td><td><span id='mode'>?</span></td><td>Temp or PS4 mapping</td></tr>";
+  h+="<tr><td>Fail State</td><td><span id='fail'>?</span></td><td>YES=Failsafe full fan</td></tr>";
+  h+="</table>";
   h+="</div>";
 
-  // Debug / Test slider section (for diagnosing UI issues)
-  h+="<div class='section'>";
-  h+="<h3>Debug</h3>";
-  h+="<div class='control-group'>";
-  h+="<label for='test_v'>Test V:</label>";
-  h+="<input type='range' id='test_v' class='slider' min='0.600' max='1.200' step='0.001' value='"+String(test_v,3)+"' oninput=\"var v=this.value;var el=document.getElementById('test_v_val');if(el){el.textContent=parseFloat(v).toFixed(3);}\">";
-  h+="<span class='value-display' id='test_v_val'>"+String(test_v,3)+"</span>";
-  h+="<button class='reset-btn' onclick=\"resetParam('test_v')\">↺</button>";
-  h+="</div>";
-  h+="</div>";
+  // Debug section removed
 
   h+="<div class='section'>";
   h+="<h3>PS4 Input Mapping</h3>";
@@ -343,20 +335,25 @@ String htmlPage(){
   h+="function xhrText(url,cb){try{var x=new XMLHttpRequest();x.onreadystatechange=function(){if(x.readyState==4){if(x.status==200)cb(null,x.responseText);else cb(new Error('status '+x.status));}};x.open('GET',url,true);x.send();}catch(e){cb(e);}}";
   h+="// Load defaults early\n";
   h+="xhrJSON('/defaults',function(err,d){if(!err && d && d.defaults){defaults=d.defaults;}});";
-  h+="function loadConfigToUI(cfg){var info={'test_v':3,'vin_min_v':3,'vin_max_v':3,'lift_span':1,'floor_pct':1,'fan_max':1,'attack_ms':0,'temp_fail':0,'cal_vin_off':3,'cal_vin_gain':3,'cal_vfan_off':3,'cal_vfan_gain':3};for(var k in cfg){if(cfg.hasOwnProperty(k)){var e=$(k);if(e){e.value=cfg[k];var dec=info.hasOwnProperty(k)?info[k]:1;updateDisplay(k,cfg[k],dec);}}}setupVinConstraints();}";
-  h+="function refresh(){xhrJSON('/json',function(err,data){if(err||!data)return;var vinEl=$('vin');if(!vinEl)return; $('vin').textContent=data.vin.toFixed(3);$('vfan').textContent=data.vfan.toFixed(3);$('vfanm').textContent=data.vfanm.toFixed(3);$('dutyB').textContent=data.dutyB.toFixed(1);$('temp0').textContent=(data.temp0!=null)?data.temp0.toFixed(1):'—';$('temp1').textContent=(data.temp1!=null)?data.temp1.toFixed(1):'—';$('dscount').textContent=data.dscount;$('mode').textContent=data.mode?'Temp':'PS4';$('fail').textContent=data.fail?'YES':'no';if(data.config && !configLoaded){loadConfigToUI(data.config);configLoaded=true;}});}";
-  h+="function setupSliderListeners(){var sliders=[['test_v',3],['vin_min_v',3],['vin_max_v',3],['lift_span',1],['floor_pct',1],['fan_max',1],['attack_ms',0],['temp_fail',0],['cal_vin_off',3],['cal_vin_gain',3],['cal_vfan_off',3],['cal_vfan_gain',3]];for(var i=0;i<sliders.length;i++){var id=sliders[i][0],dec=sliders[i][1];var s=$(id);if(!s)continue;(function(id,dec,s){function handler(){updateDisplay(id,s.value,dec);if(id==='vin_min_v'||id==='vin_max_v')applyVinConstraints();}s.addEventListener('input',handler);s.addEventListener('change',handler);handler();})(id,dec,s);}if(!window.__mirror){window.__mirror=setInterval(function(){for(var i=0;i<sliders.length;i++){var id=sliders[i][0],dec=sliders[i][1];var s=$(id);if(s)updateDisplay(id,s.value,dec);}},700);} }";
+  // Correct loadConfigToUI (previous stray JS removed)
+  h+="function loadConfigToUI(cfg){try{if(window.console)console.log('Config received',cfg);}catch(e){}var info={vin_min_v:3,vin_max_v:3,lift_span:1,floor_pct:1,fan_max:1,attack_ms:0,temp_fail:0,cal_vin_off:3,cal_vin_gain:3,cal_vfan_off:3,cal_vfan_gain:3};var curveKeys={};for(var i=0;i<5;i++){curveKeys['t'+i]=true;curveKeys['f'+i]=true;}var allZero=true;for(var i=0;i<5;i++){if(cfg.hasOwnProperty('t'+i)&&parseFloat(cfg['t'+i])!==0){allZero=false;break;}}if(allZero){if(window.console)console.warn('Curve all zero - using defaults');for(var i=0;i<5;i++){if(defaults.hasOwnProperty('t'+i)){cfg['t'+i]=defaults['t'+i];cfg['f'+i]=defaults['f'+i];}}}for(var k in cfg){if(!cfg.hasOwnProperty(k)||curveKeys[k])continue;var el=$(k);if(el){var dec=info.hasOwnProperty(k)?info[k]:(k.indexOf('gain')>-1||k.indexOf('off')>-1?3:1);el.value=cfg[k];updateDisplay(k,cfg[k],dec);}}for(var i=0;i<5;i++){var tk='t'+i,fk='f'+i;var tEl=$(tk),fEl=$(fk);if(tEl&&cfg.hasOwnProperty(tk))tEl.value=cfg[tk];if(fEl&&cfg.hasOwnProperty(fk))fEl.value=cfg[fk];}setupVinConstraints();}";
+  h+="var __cfgTries=0;";
+  h+="function refresh(){xhrJSON('/json',function(err,data){if(err||!data)return;var vinEl=$('vin');if(!vinEl)return; $('vin').textContent=data.vin.toFixed(3);$('vfan').textContent=data.vfan.toFixed(3);$('vfanm').textContent=data.vfanm.toFixed(3);$('dutyB').textContent=data.dutyB.toFixed(1);$('temp0').textContent=(data.temp0!=null)?data.temp0.toFixed(1):'—';$('temp1').textContent=(data.temp1!=null)?data.temp1.toFixed(1):'—';$('dscount').textContent=data.dscount;$('mode').textContent=data.mode?'Temp':'PS4';$('fail').textContent=data.fail?'YES':'no';if(data.config && !configLoaded){var defaultsReady=false;for(var k in defaults){if(defaults.hasOwnProperty(k)){defaultsReady=true;break;}}var allZero=true;for(var i=0;i<5;i++){var tk='t'+i; if(!data.config.hasOwnProperty(tk)){allZero=false;break;} if(parseFloat(data.config[tk])!==0){allZero=false;break;}}if((!data.curve_ok && allZero) || !defaultsReady){ if(__cfgTries<6){ if(window.console)console.warn('Deferring config apply (try '+__cfgTries+') curve_ok='+data.curve_ok+' allZero='+allZero+' defaultsReady='+defaultsReady); __cfgTries++; setTimeout(refresh,250); return; } else { if(window.console)console.warn('Applying config after max retries; using whatever values present'); } } loadConfigToUI(data.config); configLoaded=true;}});}";
+  h+="function setupSliderListeners(){var sliders=[[\"vin_min_v\",3],[\"vin_max_v\",3],[\"lift_span\",1],[\"floor_pct\",1],[\"fan_max\",1],[\"attack_ms\",0],[\"temp_fail\",0],[\"cal_vin_off\",3],[\"cal_vin_gain\",3],[\"cal_vfan_off\",3],[\"cal_vfan_gain\",3]];";
+  h+="for(var i=0;i<sliders.length;i++){var id=sliders[i][0],dec=sliders[i][1];var s=$(id);if(!s)continue;(function(id,dec,s){function handler(){updateDisplay(id,s.value,dec);if(id==='vin_min_v'||id==='vin_max_v')applyVinConstraints();}s.addEventListener('input',handler);s.addEventListener('change',handler);handler();})(id,dec,s);}";
+  h+="if(!window.__mirror){window.__mirror=setInterval(function(){for(var i=0;i<sliders.length;i++){var id=sliders[i][0],dec=sliders[i][1];var s=$(id);if(s)updateDisplay(id,s.value,dec);}},700);} }";
   h+="function setupVinConstraints(){var a=$('vin_min_v'),b=$('vin_max_v');if(a&&b)applyVinConstraints();}";
   h+="function applyVinConstraints(){var a=$('vin_min_v'),b=$('vin_max_v');if(!a||!b)return;var vmin=parseFloat(a.value)||0.600;var vmax=parseFloat(b.value)||1.000;if(vmax<=vmin+0.010){vmax=vmin+0.020;b.value=vmax.toFixed(3);updateDisplay('vin_max_v',vmax,3);}b.min=(vmin+0.010).toFixed(3);a.max=(vmax-0.010).toFixed(3);}";
-  h+="function saveSettings(){var ids=['test_v','vin_min_v','vin_max_v','lift_span','floor_pct','fan_max','attack_ms','temp_fail','cal_vin_off','cal_vin_gain','cal_vfan_off','cal_vfan_gain'];var q='';for(var i=0;i<ids.length;i++){var e=$(ids[i]);if(e)q+=encodeURIComponent(ids[i])+'='+encodeURIComponent(e.value)+'&';}for(var i=0;i<5;i++){var t=$('t'+i),f=$('f'+i);if(t)q+='t'+i+'='+encodeURIComponent(t.value)+'&';if(f)q+='f'+i+'='+encodeURIComponent(f.value)+'&';}if(q.length>0)q=q.substring(0,q.length-1);xhrText('/set?'+q,function(err){if(err)alert('Save failed');else alert('Settings saved');});}";
-  h+="function resetParam(key){if(!defaults.hasOwnProperty(key))return;var e=$(key);if(!e)return;var info={'test_v':3,'vin_min_v':3,'vin_max_v':3,'lift_span':1,'floor_pct':1,'fan_max':1,'attack_ms':0,'temp_fail':0,'cal_vin_off':3,'cal_vin_gain':3,'cal_vfan_off':3,'cal_vfan_gain':3};e.value=defaults[key];var dec=info.hasOwnProperty(key)?info[key]:1;updateDisplay(key,defaults[key],dec);if(key==='vin_min_v'||key==='vin_max_v')applyVinConstraints();}";
+  h+="function saveSettings(){var ids=['vin_min_v','vin_max_v','lift_span','floor_pct','fan_max','attack_ms','temp_fail','cal_vin_off','cal_vin_gain','cal_vfan_off','cal_vfan_gain'];var q='';for(var i=0;i<ids.length;i++){var e=$(ids[i]);if(e)q+=encodeURIComponent(ids[i])+'='+encodeURIComponent(e.value)+'&';}for(var i=0;i<5;i++){var t=$('t'+i),f=$('f'+i);if(t)q+='t'+i+'='+encodeURIComponent(t.value)+'&';if(f)q+='f'+i+'='+encodeURIComponent(f.value)+'&';}if(q.length>0)q=q.substring(0,q.length-1);xhrText('/set?'+q,function(err){if(err)alert('Save failed');else alert('Settings saved');});}";
+  h+="function resetParam(key){if(!defaults.hasOwnProperty(key))return;var e=$(key);if(!e)return;var info={'vin_min_v':3,'vin_max_v':3,'lift_span':1,'floor_pct':1,'fan_max':1,'attack_ms':0,'temp_fail':0,'cal_vin_off':3,'cal_vin_gain':3,'cal_vfan_off':3,'cal_vfan_gain':3};e.value=defaults[key];var dec=info.hasOwnProperty(key)?info[key]:1;updateDisplay(key,defaults[key],dec);if(key==='vin_min_v'||key==='vin_max_v')applyVinConstraints();}";
   h+="function resetTempPoint(i){var tk='t'+i,fk='f'+i;if(defaults.hasOwnProperty(tk))$('t'+i).value=defaults[tk];if(defaults.hasOwnProperty(fk))$('f'+i).value=defaults[fk];}";
-  h+="function resetAllSettings(){var k;for(k in defaults){if(defaults.hasOwnProperty(k)){var e=$(k);if(e){e.value=defaults[k];updateDisplay(k,defaults[k],3);}}}setupVinConstraints();saveSettings();}";
+  h+="function resetAllSettings(){var k;for(k in defaults){if(!defaults.hasOwnProperty(k))continue;var e=$(k);if(e){e.value=defaults[k];updateDisplay(k,defaults[k],3);}}setupVinConstraints();saveSettings();}";
   h+="function toggleMode(){xhrText('/toggle',function(){});}";
   h+="function factoryReset(){if(!confirm('Erase and reboot?'))return;xhrText('/factory',function(){alert('Rebooting...');setTimeout(function(){location.reload();},1500);});}";
-  h+="function drawChart(c,xs,ys,col,yMin,yMax,yl){var ctx=c.getContext('2d');var W=c.width=c.clientWidth,H=c.height=c.clientHeight;ctx.clearRect(0,0,W,H);ctx.fillStyle='#fff';ctx.fillRect(0,0,W,H);var L=40,R=10,T=10,B=20,w=W-L-R,h=H-T-B;ctx.strokeStyle='#ddd';ctx.beginPath();for(var g=0;g<=4;g++){var y=T+h*g/4;ctx.moveTo(L,y);ctx.lineTo(W-R,y);}ctx.stroke();ctx.strokeStyle='#000';ctx.beginPath();ctx.moveTo(L,T);ctx.lineTo(L,H-B);ctx.lineTo(W-R,H-B);ctx.stroke();ctx.fillStyle='#000';ctx.font='12px sans-serif';ctx.fillText(yl,5,12);if(xs.length<2)return;var x0=xs[0],x1=xs[xs.length-1];function X(x){return L+(x-x0)/( (x1-x0)||1 )*w;}function Y(y){return T+(1-(y-yMin)/( (yMax-yMin)||1 ))*h;}ctx.strokeStyle=col;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(X(xs[0]),Y(ys[0]));for(var i=1;i<xs.length;i++)ctx.lineTo(X(xs[i]),Y(ys[i]));ctx.stroke();}";
+  h+="function drawChart(c,xs,ys,col,yMin,yMax,yl,stats){var ctx=c.getContext('2d');var W=c.width=c.clientWidth,H=c.height=c.clientHeight;ctx.clearRect(0,0,W,H);ctx.fillStyle='#fff';ctx.fillRect(0,0,W,H);var L=50,R=8,T=8,B=22,w=W-L-R,h=H-T-B;ctx.strokeStyle='#eee';ctx.lineWidth=1;ctx.beginPath();for(var g=0;g<=4;g++){var y=T+h*g/4;ctx.moveTo(L,y);ctx.lineTo(W-R,y);}ctx.stroke();ctx.fillStyle='#444';ctx.font='11px sans-serif';for(var g=0;g<=4;g++){var val=yMax-(yMax-yMin)*g/4;var y=T+h*g/4+4;ctx.fillText(val.toFixed( (Math.abs(yMax-yMin)<5)?2:1 ),5,y);}ctx.strokeStyle='#222';ctx.beginPath();ctx.moveTo(L,T);ctx.lineTo(L,H-B);ctx.lineTo(W-R,H-B);ctx.stroke();ctx.fillStyle='#000';ctx.font='12px sans-serif';ctx.fillText(yl,5,12);if(xs.length<2)return;var x0=xs[0],x1=xs[xs.length-1];function X(x){return L+(x-x0)/( (x1-x0)||1 )*w;}function Y(y){return T+(1-(y-yMin)/( (yMax-yMin)||1 ))*h;}ctx.strokeStyle=col;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(X(xs[0]),Y(ys[0]));for(var i=1;i<xs.length;i++)ctx.lineTo(X(xs[i]),Y(ys[i]));ctx.stroke();if(stats){ctx.fillStyle='rgba(0,0,0,0.65)';ctx.font='10px monospace';var txt='min '+stats.min.toFixed(stats.dp)+'  max '+stats.max.toFixed(stats.dp)+'  cur '+stats.cur.toFixed(stats.dp)+'  avg '+stats.avg.toFixed(stats.dp);var tw=ctx.measureText(txt).width+8;var th=14;ctx.fillRect(W-tw-4,T+2,tw,th);ctx.fillStyle='#fff';ctx.fillText(txt,W-tw, T+12);} }";
   h+="function arrMin(a,def){if(a.length==0)return def;var m=a[0];for(var i=1;i<a.length;i++)if(a[i]<m)m=a[i];return Math.min(m,def);}function arrMax(a,def){if(a.length==0)return def;var m=a[0];for(var i=1;i<a.length;i++)if(a[i]>m)m=a[i];return Math.max(m,def);}";
-  h+="function renderCharts(){xhrJSON('/history',function(err,a){if(err||!a||a.length<2)return;var xs=[],temps=[],fans=[],vfm=[];for(var i=0;i<a.length;i++){xs.push(a[i].t);temps.push(a[i].thot);fans.push(a[i].vfan);vfm.push(a[i].vfanm);}var tmin=arrMin(temps,30),tmax=arrMax(temps,90);drawChart(document.getElementById('cTemp'),xs,temps,'#c00',tmin,tmax,'°C');drawChart(document.getElementById('cFan'),xs,fans,'#06c',0,100,'%');var vmin=arrMin(vfm,0.8),vmax=arrMax(vfm,1.3);drawChart(document.getElementById('cVfan'),xs,vfm,'#090',vmin,vmax,'Vfan');});}";
+  h+="function statObj(a){var n=a.length;var mn=a[0],mx=a[0],sum=0;for(var i=0;i<n;i++){var v=a[i];if(v<mn)mn=v;if(v>mx)mx=v;sum+=v;}return {min:mn,max:mx,cur:a[n-1],avg:sum/n,dp:(Math.abs(mx-mn)<5?2:1)};}";
+  h+="function renderCharts(){xhrJSON('/history',function(err,a){if(err||!a||a.length<2)return;var xs=[],temps=[],duty=[],vfm=[];for(var i=0;i<a.length;i++){xs.push(a[i].t);temps.push(a[i].thot);duty.push(a[i].duty);vfm.push(a[i].vfanm);}var tmin=arrMin(temps,30),tmax=arrMax(temps,90);drawChart(document.getElementById('cTemp'),xs,temps,'#c00',tmin,tmax,'°C',statObj(temps));drawChart(document.getElementById('cFan'),xs,duty,'#06c',0,100,'Lift %',statObj(duty));var vmin=arrMin(vfm,0.8),vmax=arrMax(vfm,1.3);drawChart(document.getElementById('cVfan'),xs,vfm,'#090',vmin,vmax,'Vfan',statObj(vfm));});}";
   h+="function initializeUI(){setupSliderListeners();refresh();setInterval(refresh,1000);setInterval(renderCharts,2500);}";
   h+="if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',initializeUI);}else{initializeUI();}";
   h+="</script>";
@@ -370,7 +367,7 @@ void handleRoot(){ server.send(200,"text/html",htmlPage()); }
 
 void handleDefaults(){
   String j="{\"defaults\":{";
-  j+="\"test_v\":"+String(D.test_v,3)+","; // added
+  // test_v removed from defaults JSON
   j+="\"vin_min_v\":"+String(D.vin_min_v,3)+",";
   j+="\"vin_max_v\":"+String(D.vin_max_v,3)+",";
   j+="\"floor_pct\":"+String(D.floor_pct,1)+",";
@@ -392,7 +389,7 @@ void handleDefaults(){
 
 void handleSet(){
   // read args
-  if(server.hasArg("test_v")) test_v = server.arg("test_v").toFloat();
+  // test_v removed
   if(server.hasArg("vin_min_v"))vin_min_v=server.arg("vin_min_v").toFloat();
   if(server.hasArg("vin_max_v"))vin_max_v=server.arg("vin_max_v").toFloat();
   if(server.hasArg("floor_pct"))floor_pct=server.arg("floor_pct").toFloat();
@@ -404,9 +401,41 @@ void handleSet(){
   if(server.hasArg("cal_vin_gain")) cal_vin_gain= server.arg("cal_vin_gain").toFloat();
   if(server.hasArg("cal_vfan_off")) cal_vfan_off= server.arg("cal_vfan_off").toFloat();
   if(server.hasArg("cal_vfan_gain"))cal_vfan_gain=server.arg("cal_vfan_gain").toFloat();
+  bool anyCurveProvided=false;
+  bool anyNonZero=false;
+  float new_t[5];
+  float new_f[5];
   for(int i=0;i<5;i++){
-    if(server.hasArg("t"+String(i)))temp_pt[i]=server.arg("t"+i).toFloat();
-    if(server.hasArg("f"+String(i)))fan_pt[i]=server.arg("f"+i).toFloat();
+    String keyT = String("t") + i;   // ensure proper concatenation (avoid pointer arithmetic bug)
+    String keyF = String("f") + i;
+    bool hasT = server.hasArg(keyT);
+    bool hasF = server.hasArg(keyF);
+    if(hasT){
+      anyCurveProvided = true;
+      String rawT = server.arg(keyT);
+      new_t[i] = rawT.toFloat();
+      if(new_t[i] != 0) anyNonZero = true;
+      if(Serial){ Serial.print("handleSet curve arg "); Serial.print(keyT); Serial.print("="); Serial.println(rawT); }
+    } else {
+      new_t[i] = temp_pt[i];
+    }
+    if(hasF){
+      anyCurveProvided = true;
+      String rawF = server.arg(keyF);
+      new_f[i] = rawF.toFloat();
+      if(new_f[i] != 0) anyNonZero = true;
+      if(Serial){ Serial.print("handleSet curve arg "); Serial.print(keyF); Serial.print("="); Serial.println(rawF); }
+    } else {
+      new_f[i] = fan_pt[i];
+    }
+  }
+  if(anyCurveProvided){
+    if(!anyNonZero){
+      // Reject all-zero curve update (likely empty form submission); keep existing values
+      if(Serial) Serial.println("handleSet: Ignoring all-zero submitted curve (keeping previous)" );
+    } else {
+      for(int i=0;i<5;i++){ temp_pt[i]=new_t[i]; fan_pt[i]=new_f[i]; }
+    }
   }
 
   // sanitize and enforce range/gap
@@ -434,7 +463,7 @@ void handleSet(){
 
   // persist
   prefs.begin("fan",false);
-  prefs.putFloat("test_v", test_v);
+  // prefs: test_v removed
   prefs.putFloat("vin_min_v",vin_min_v);
   prefs.putFloat("vin_max_v",vin_max_v);
   prefs.putFloat("floor_pct",floor_pct);
@@ -457,12 +486,20 @@ void handleSet(){
 }
 
 void handleJson(){
+  if(Serial){
+    Serial.print("/json curve pts T:");
+    for(int i=0;i<5;i++){Serial.print(temp_pt[i]);Serial.print(i<4?',':' ');}Serial.print(" F:");
+    for(int i=0;i<5;i++){Serial.print(fan_pt[i]);Serial.print(i<4?',':' ');}Serial.println();
+  }
   String j="{";
-  j+="\"test_v\":"+String(test_v,3)+","; // echo live test_v
+  // Determine if curve appears intentionally populated (not all zeros)
+  bool curve_ok=false; for(int i=0;i<5;i++){ if(temp_pt[i]!=0 || fan_pt[i]!=0){ curve_ok=true; break; } }
+  // test_v removed from /json live
   j+="\"vin\":"+String(vin_now,3)+",";
   j+="\"vfan\":"+String(vfan_model,3)+",";
   j+="\"vfanm\":"+String(vfan_meas,3)+",";
   j+="\"dutyB\":"+String(dutyB_now,1)+",";
+  j+="\"curve_ok\":" + String(curve_ok?"true":"false") + ","; // flag for UI to decide retry/fallback
   if (tempValid(temp_hot))   j+="\"temp0\":"+String(temp_hot,1)+","; else j+="\"temp0\":null,";
   if (tempValid(temp_other)) j+="\"temp1\":"+String(temp_other,1)+","; else j+="\"temp1\":null,";
   j+="\"dscount\":"+String(ds_count)+",";
@@ -470,7 +507,7 @@ void handleJson(){
   j+="\"fail\":" + String(fan_fail ? "true" : "false") + ",";
   // current config for first-time UI fill
   j+="\"config\":{";
-  j+="\"test_v\":"+String(test_v,3)+",";
+  // test_v removed from config object
   j+="\"vin_min_v\":"+String(vin_min_v,3)+",";
   j+="\"vin_max_v\":"+String(vin_max_v,3)+",";
   j+="\"floor_pct\":"+String(floor_pct,1)+",";
@@ -525,6 +562,19 @@ unsigned long lastUpdate=0;
 
 void setup(){
   Serial.begin(115200);
+  unsigned long _t0 = millis();
+  while(!Serial && (millis()-_t0)<1200) { /* wait briefly for USB CDC */ }
+  delay(300); // extra settle time for host enumeration
+  Serial.println();
+  Serial.println("\n=== PS4 Fan Ctrl Boot ===");
+  Serial.printf("Build: %s %s\n", __DATE__, __TIME__);
+  Serial.printf("CPU freq: %u MHz  Free heap: %u\n", (unsigned)(ESP.getCpuFreqMHz()), (unsigned)ESP.getFreeHeap());
+#ifdef ARDUINO_USB_CDC_ON_BOOT
+  Serial.println("USB CDC compile flag active");
+#endif
+  Serial.printf("Chip rev: %d  SDK: %s\n", ESP.getChipRevision(), ESP.getSdkVersion());
+  Serial.println("Init peripherals...");
+  Serial.flush();
 
   analogReadResolution(12);
   analogSetPinAttenuation(PIN_PS4_IN, ADC_11db);  // 0..~3.3 V
@@ -545,7 +595,7 @@ void setup(){
 
   // Load saved params
   prefs.begin("fan",true);
-  test_v = prefs.getFloat("test_v", test_v);
+  // load test_v removed
   vin_min_v=prefs.getFloat("vin_min_v",vin_min_v);
   vin_max_v=prefs.getFloat("vin_max_v",vin_max_v);
   floor_pct=prefs.getFloat("floor_pct",floor_pct);
@@ -587,5 +637,11 @@ void loop(){
   if (millis()-lastUpdate > 50){
     updateControl();
     lastUpdate = millis();
+  }
+  // Heartbeat every second so late-attached monitors show activity
+  static unsigned long lastBeat=0; 
+  if(millis()-lastBeat > 1000){
+    Serial.println("HB");
+    lastBeat = millis();
   }
 }
