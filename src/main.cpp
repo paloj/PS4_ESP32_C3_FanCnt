@@ -19,29 +19,27 @@
 // Wi-Fi AP
 const char* ssid = "PS4FAN-CTRL";
 const char* password = "12345678";
-WebServer server(80);
-Preferences prefs;
+// --- Restored global objects (lost during previous patch corruption) ---
+Preferences prefs;                 // NVS key/value storage
+OneWire oneWire(PIN_DS18B20);      // 1-Wire bus on defined pin
+DallasTemperature sensors(&oneWire); // DS18B20 temperature sensors
+WebServer server(80);              // HTTP server
 
-OneWire oneWire(PIN_DS18B20);
-DallasTemperature sensors(&oneWire);
-
-// -------- DEFAULTS ----------
+// Defaults struct (restored after accidental corruption in previous patch)
 struct Defaults {
-  float vin_min_v   = 0.600f;  // PS4 signal low end
-  float vin_max_v   = 1.000f;  // PS4 signal high end
-  float floor_pct   = 32.1f;   // baseline % on PWM_A
-  float lift_span   = 20.0f;   // range % on PWM_B
-  float fan_max     = 100.0f;  // cap for PWM_B
-  float attack_ms   = 200.0f;  // ms per 1% delta
-  float temp_fail   = 80.0f;   // °C → full fan failsafe
-  bool  use_temp_mode = true;  // Start in temp mode since that's primary use
-  float temp_pt[5] = {30, 35, 40, 45, 55};
-  float fan_pt[5]  = {10, 15, 20, 30, 100};
-  // Desired fan node voltage window (based on feedback) for full operating range
-  float node_v_min = 1.03f;    // fan just starts reliably
-  float node_v_max = 1.18f;    // full speed target ceiling
-  // ADC calibration defaults (centered in slider ranges)
-  float cal_vin_gain  = 1.000f, cal_vin_off  = 0.000f;   // gain: 0.8-1.2, off: -0.5 to +0.5
+  float vin_min_v   = 0.60f;   // PS4 analog low end
+  float vin_max_v   = 1.00f;   // PS4 analog high end
+  float floor_pct   = 77.0f;   // empirical baseline % on PWM_A
+  float lift_span   = 20.0f;   // logical lift span used in PS4 mode mapping
+  float fan_max     = 100.0f;  // logical cap pre-normalization
+  float attack_ms   = 200.0f;  // ms per 1% change (slew)
+  float temp_fail   = 80.0f;   // °C failsafe
+  bool  use_temp_mode = true;  // start in temp mode
+  float temp_pt[5] = {30,35,40,45,55};
+  float fan_pt [5] = {10,15,20,30,100};
+  float node_v_min = 1.044f;   // voltage window min
+  float node_v_max = 1.180f;   // voltage window max
+  float cal_vin_gain  = 1.000f, cal_vin_off  = 0.000f;
   float cal_vfan_gain = 1.000f, cal_vfan_off = 0.000f;
 } D;
 
@@ -58,11 +56,9 @@ bool  use_temp_mode = D.use_temp_mode;
 float temp_pt[5] = {D.temp_pt[0],D.temp_pt[1],D.temp_pt[2],D.temp_pt[3],D.temp_pt[4]};
 float fan_pt [5] = {D.fan_pt [0],D.fan_pt [1],D.fan_pt [2],D.fan_pt [3],D.fan_pt [4]};
 
-// Fan node voltage window
 float node_v_min = D.node_v_min;
 float node_v_max = D.node_v_max;
 
-// ADC calibration (UI sliders)
 float cal_vin_gain  = D.cal_vin_gain,  cal_vin_off  = D.cal_vin_off;
 float cal_vfan_gain = D.cal_vfan_gain, cal_vfan_off = D.cal_vfan_off;
 // test_v removed
@@ -74,16 +70,23 @@ float temp_hot=0;       // hottest DS18B20 (used for control)
 float temp_other=NAN;   // the other (display only)
 int   ds_count=0;
 bool  fan_fail=false;
-
-// -------- WINDOW NORMALIZATION DIAGNOSTICS ----------
-// Physical (actual PWM_B duty %) range that corresponds to logical 0..100 span
-float dutyB_min_phys = 0.0f;
-float dutyB_max_phys = 100.0f;
+// Debug instrumentation (live analog model values)
+float dbg_VA=0, dbg_VB=0, dbg_VB_needed=0, dbg_vnode=0; // volts (VA= floor node drive via 10k, VB = lift via 5.1k)
+// (Removed stray parser code accidentally injected into global scope)
+float dutyB_min_phys = 0.0f;       // physical lower bound for lift duty after normalization
+float dutyB_max_phys = 100.0f;     // physical upper bound (may shrink when window compressed)
 // Compression / validity flags
 bool win_comp_low=false;   // floor alone already >= node_v_min
 bool win_comp_high=false;  // cannot reach node_v_max (VB would exceed 3.3V)
 bool win_invalid=false;    // floor pushes node above node_v_max (window inverted)
 bool floor_auto_event=false; // set true when floor auto-raised this session (sticky until next /set)
+bool win_impossible=false; // new: both ends unattainable (logic will mark when detected)
+// Window bypass (fallback) triggers when physical window deemed invalid/impossible
+bool window_bypass=false;        // active state (auto or forced)
+bool window_bypass_force=false;  // user-forced via serial 'bypass on/off'
+
+// Raw PWM override (diagnostic) bypasses all mapping & calibration (serial 'raw')
+bool raw_override=false; float raw_dutyA=0, raw_dutyB=0; // percent 0-100
 
 // Persistence debounce for auto floor adjustments
 static unsigned long lastFloorPersist=0;
@@ -95,8 +98,45 @@ constexpr float R_B = 5100.0f;
 constexpr float W_A = (1.0f/R_A)/((1.0f/R_A)+(1.0f/R_B));
 constexpr float W_B = 1.0f - W_A; // should be ~0.6623
 
+// Learned bias + effective weights model: vnode = v_bias + wA_eff*VA + wB_eff*VB
+float v_bias = 0.0f;      // baseline with VA=VB=0
+float wA_eff = W_A;       // effective channel A weight
+float wB_eff = W_B;       // effective channel B weight
+bool  model_learned=false; // set true after successful learn sequence
+// Adaptive overlap scaling (accounts for non-additive interaction of channels when both active)
+float learn_alpha = 1.0f;          // EMA scale applied to (wA*VA + wB*VB)
+bool  learn_alpha_set = false;     // becomes true once first ratio sample taken
+float learn_alpha_last_saved = 1.0f; // last persisted value
+unsigned long learn_alpha_last_persist_ms = 0; // debounce persistence
+bool  learn_alpha_frozen = false;  // freeze adaptation when true
+float vfan_pred_raw = 0;           // raw (unscaled) predicted vnode using learned weights (for alpha update)
+bool cal_warn_floor_low=false;    // could not raise floor to reach node_v_min
+bool cal_warn_overshoot=false;    // extreme overshoot measurement during phase2
+bool alpha_adapt_enabled = true;   // disabled during AutoCal to freeze model
+bool cal_warn_lift_near_full=false; // lift channel nearly saturated after calibration
+
+// Guard / tuning constants
+static const float MAX_CAL_FLOOR_PCT = 45.0f;         // Cap how high AutoCal may raise floor
+static const float COMP_MEAS_HYST = 0.006f;           // Hysteresis for measurement-based compression
+static const float BASELINE_RECHECK_MARGIN = 0.015f;  // Margin below node_v_min to clear false compression
+static const float FULL_LIFT_WARN_THRESH = 97.0f;     // Duty% threshold considered "near full"
+
+// Learning (characterization) state machine
+enum LearnState { L_IDLE=0, L_RUN_A, L_RUN_B, L_COMPUTE, L_DONE, L_ABORT }; LearnState learn_state=L_IDLE;
+static const float LEARN_SEQ_A[] = {0,10,20,40,60,80};
+static const float LEARN_SEQ_B[] = {0,10,20,40,60,80};
+float learn_vals_A[sizeof(LEARN_SEQ_A)/sizeof(float)]; // measured vnode for each A duty (B=0)
+float learn_vals_B[sizeof(LEARN_SEQ_B)/sizeof(float)]; // measured vnode for each B duty (A=0)
+int learn_step=0; unsigned long learn_step_start=0; const unsigned long LEARN_SETTLE_MS=220; // generous settle
+bool learn_dirty=false; // need persistence
+void resetLearn(){ learn_state=L_IDLE; learn_step=0; }
+
 // -------- AUTO CALIBRATION (node voltage) ----------
-enum AutoCalState { AC_IDLE=0, AC_P1_SET, AC_P1_WAIT, AC_P1_EVAL, AC_P2_SET, AC_P2_WAIT, AC_P2_EVAL, AC_DONE, AC_ERROR=-1 };
+enum AutoCalState { AC_IDLE=0, AC_P1_SET, AC_P1_WAIT, AC_P1_EVAL, AC_P2_SET, AC_P2_WAIT, AC_P2_EVAL, AC_VALIDATE, AC_DONE, AC_ERROR=-1 };
+// Validation phase variables
+unsigned long ac_validate_start_ms = 0; float ac_validate_ref_v = 0; float ac_validate_accum_ms = 0; const float AC_VALIDATE_TOL = 0.008f; const unsigned long AC_VALIDATE_REQUIRED_MS = 5000; const unsigned long AC_VALIDATE_SAMPLE_INTERVAL_MS = 120;
+// Baseline retry / settle management
+bool ac_baseline_retry=false; unsigned long ac_baseline_retry_time=0; unsigned long ac_extra_settle_ms=0;
 AutoCalState ac_state = AC_IDLE;
 float ac_floor_lo=5.0f, ac_floor_hi=80.0f, ac_floor_mid=32.0f; // search bounds for floor (% duty)
 float ac_lift_lo=0.0f, ac_lift_hi=100.0f, ac_lift_mid=50.0f;   // search bounds for lift duty
@@ -109,6 +149,21 @@ float cal_dutyB_max = -1;             // measured physical duty needed for node_
 bool  cal_valid=false;                // set true when both phases succeed
 float ac_last_v=0;                    // last measured node
 String ac_error_msg="";
+// Calibration warnings (non-fatal)
+bool cal_warn_floor_high=false;   // floor_min (5%) already above desired node_v_min
+bool cal_warn_span_small=false;   // resulting calibrated span too small -> override ignored
+float cal_baseline_v=0;           // node voltage at floor=0, lift=0 during calibration start
+float cal_baseline_meas=0;        // most recent measured baseline (dutyB=0) for compression logic
+// Boot-time automatic baseline capture (Apply A)
+bool boot_baseline_pending=true;   // request a one-time capture after initial stabilization
+bool boot_baseline_active=false;   // currently sampling
+unsigned long boot_baseline_start=0; // time capture started
+float boot_baseline_samples[5];    // small buffer (we'll use 5 for extra robustness)
+int boot_baseline_count=0;         // number collected so far
+const unsigned long BOOT_BASELINE_DELAY_MS = 1800;   // wait after boot before starting capture (allow floor settle)
+const unsigned long BOOT_BASELINE_SAMPLE_INTERVAL_MS = 160; // spacing between samples
+unsigned long boot_baseline_last_sample=0;
+float boot_baseline_median=0;      // median computed
 // helper to invalidate calibration when config changes
 void invalidateCal(){ cal_valid=false; cal_dutyB_max=-1; if(ac_state!=AC_IDLE) ac_state=AC_ERROR; }
 
@@ -117,6 +172,30 @@ struct Sample { unsigned long t; float thot, toth, vin, vfan_mod, vfan_mea, duty
 #define HISTORY_LEN 300
 Sample history[HISTORY_LEN];
 int hist_head=0, hist_count=0;
+
+// -------- FAST HISTORY (last ~5-6s at ~100ms) ----------
+struct FastSample {
+  uint32_t t_ms;      // millis timestamp
+  float v_meas;       // measured fan node
+  float v_model;      // scaled model
+  float v_pred_raw;   // unscaled model prediction
+  float dutyB;        // lift duty
+  float floorPct;     // floor duty A
+  float alpha;        // learn_alpha
+  uint8_t flags;      // bit0:win_invalid bit1:win_impossible bit2:window_bypass bit3:raw_override bit4:cal_valid bit5:comp_low bit6:comp_high
+};
+static const int FAST_HIST_LEN = 64; // 64 * 100ms = 6.4s
+FastSample fast_hist[FAST_HIST_LEN];
+int fast_hist_head=0; int fast_hist_count=0;
+unsigned long fast_last_ms=0; const unsigned long FAST_HIST_INTERVAL_MS=100; // capture cadence
+uint8_t makeFastFlags(){
+  uint8_t f=0; if(win_invalid) f|=1<<0; if(win_impossible) f|=1<<1; if(window_bypass) f|=1<<2; if(raw_override) f|=1<<3; if(cal_valid) f|=1<<4; if(win_comp_low) f|=1<<5; if(win_comp_high) f|=1<<6; if(ac_state!=AC_IDLE && ac_state!=AC_DONE && ac_state!=AC_ERROR) f|=1<<7; return f;
+}
+void recordFastSample(){
+  FastSample &s = fast_hist[fast_hist_head];
+  s.t_ms = millis(); s.v_meas=vfan_meas; s.v_model=vfan_model; s.v_pred_raw=vfan_pred_raw; s.dutyB=dutyB_now; s.floorPct=floor_pct; s.alpha=learn_alpha; s.flags=makeFastFlags();
+  fast_hist_head = (fast_hist_head+1)%FAST_HIST_LEN; if(fast_hist_count<FAST_HIST_LEN) fast_hist_count++;
+}
 
 // -------- UTILS ----------
 uint32_t toDutyCounts(float dutyPct){
@@ -204,43 +283,102 @@ void updateControl(){
   if (tempValid(temp_hot) && temp_hot >= temp_fail) fan_fail = true;
   if (fan_fail) lift_logical = 100.0f;
 
+  // --- RAW PWM OVERRIDE (diagnostic) ---
+  if(raw_override){
+    // Directly apply user-specified duties (clamped) and skip window logic & AutoCal
+    if(raw_dutyA < 0) raw_dutyA=0; if(raw_dutyA>100) raw_dutyA=100;
+    if(raw_dutyB < 0) raw_dutyB=0; if(raw_dutyB>100) raw_dutyB=100;
+    ledcWrite(PWM_CH_A, toDutyCounts(raw_dutyA));
+    ledcWrite(PWM_CH_B, toDutyCounts(raw_dutyB));
+    dutyB_now = raw_dutyB;
+    float VA_raw = 3.3f*(raw_dutyA/100.0f);
+    float VB_raw = 3.3f*(raw_dutyB/100.0f);
+    if(model_learned){
+      vfan_pred_raw = v_bias + wA_eff*VA_raw + wB_eff*VB_raw; // unscaled raw
+      vfan_model = v_bias + learn_alpha * (wA_eff*VA_raw + wB_eff*VB_raw);
+    } else {
+      vfan_pred_raw = (VA_raw/R_A + VB_raw/R_B) / (1.0f/R_A + 1.0f/R_B);
+      vfan_model = vfan_pred_raw;
+    }
+    // Sample fan node for display (reuse measurement block from later but simplified)
+    const int VFAN_SAMPLES_RAW = 4;
+    float sumF=0; for(int i=0;i<VFAN_SAMPLES_RAW;i++){ int mv_fb = analogReadMilliVolts(PIN_FAN_FB); sumF += (mv_fb/1000.0f); }
+    float vfan_avg = (sumF / VFAN_SAMPLES_RAW) * cal_vfan_gain + cal_vfan_off;
+    vfan_raw = vfan_avg; const float ALPHA_VFAN = 0.30f; // quicker while in raw
+    vfan_meas = (vfan_meas==0?vfan_avg:(vfan_meas + ALPHA_VFAN*(vfan_avg - vfan_meas)));
+    // Instrumentation reflect raw
+    dbg_VA = VA_raw; dbg_VB = VB_raw; dbg_vnode = vfan_meas; dbg_VB_needed = VB_raw;
+    // Throttled debug print for raw override visibility
+    if(Serial){ static unsigned long lastRawLog=0; unsigned long now=millis(); if(now-lastRawLog>350){
+        Serial.printf("[RAW] A=%.1f%% B=%.1f%% vnode=%.3fV pred=%.3f\n", raw_dutyA, raw_dutyB, vfan_meas, vfan_pred_raw); lastRawLog=now; } }
+    // History log rate preserved below at loop level
+    return;
+  }
+
 
   // --- Map logical lift (0..100) into physical PWM_B duty range that produces node_v_min..node_v_max ---
   // Compute current VA from floor
   float VA = 3.3f*(floor_pct/100.0f);
 
   // Desired node voltage window endpoints relative to current floor
-  // Solve VB for each endpoint: VB = (Vnode - W_A*VA)/W_B
-  float VB_min = (node_v_min - W_A*VA)/W_B; // volts
-  float VB_max = (node_v_max - W_A*VA)/W_B; // volts
+    // Bias-aware solve: VB = (Vnode - v_bias - wA_eff*VA)/wB_eff
+    float VB_min = (node_v_min - v_bias - wA_eff*VA)/wB_eff; // volts
+    float VB_max = (node_v_max - v_bias - wA_eff*VA)/wB_eff; // volts
 
   win_comp_low = false; win_comp_high=false; win_invalid=false;
+  // Measurement-based compression: if baseline measurement shows floor already at/above node_v_min
+  if(cal_baseline_meas > 0 && cal_baseline_meas >= node_v_min - COMP_MEAS_HYST){
+    win_comp_low = true;
+  }
 
   // If floor already above max endpoint: window invalid (floor too high)
-  if (W_A*VA >= node_v_max){
+  if ((v_bias + wA_eff*VA) >= node_v_max){
     win_invalid = true;
     // Collapse window at floor-implied level: physical duty span zero
     VB_min = VB_max = 0.0f; // we will drive 0 on lift channel (floor alone exceeds target window)
   }
 
-  // If VB_min <= 0 => floor alone achieves (or exceeds) node_v_min → compress low side
-  if (VB_min <= 0.0f){ VB_min = 0.0f; win_comp_low=true; }
+  // Fallback model-only compression if measurement didn't already assert
+  if(win_comp_low && cal_baseline_meas>0){
+    // Measurement-based compression: force VB_min to 0 exactly to allow full logical low span
+    VB_min = 0.0f;
+  } else if(!win_comp_low){
+    if (VB_min <= 0.0f){ VB_min = 0.0f; win_comp_low=true; }
+  }
   // If VB_max beyond supply (3.3V) we cannot reach full node_v_max
   if (VB_max >= 3.3f){ VB_max = 3.3f; win_comp_high=true; }
   // Guard if after adjustments VB_max < VB_min (extreme floor raise). Treat as collapsed window
   if (VB_max < VB_min + 0.0005f){ VB_max = VB_min; }
+  // Mark impossible if both compression flags asserted strongly and collapsed
+  win_impossible = (win_comp_low && win_comp_high) || (win_invalid && VB_max==VB_min);
 
   dutyB_min_phys = (VB_min/3.3f)*100.0f;
   dutyB_max_phys = (VB_max/3.3f)*100.0f;
   if (dutyB_min_phys < 0) dutyB_min_phys = 0; if (dutyB_min_phys > 100) dutyB_min_phys = 100;
   if (dutyB_max_phys < 0) dutyB_max_phys = 0; if (dutyB_max_phys > 100) dutyB_max_phys = 100;
 
+  // Determine auto window bypass activation (option C)
+  bool auto_bypass = (win_invalid || cal_warn_floor_high || win_impossible);
+  window_bypass = (window_bypass_force || auto_bypass);
+  if(window_bypass){
+    // Provide full 0..100 physical span (no compression); ignore calibration override
+    dutyB_min_phys = 0.0f;
+    dutyB_max_phys = 100.0f;
+    // Calibration not used while bypassing mapping
+  }
+
   float dutyB_tgt_phys;
   // If calibration valid, override computed physical window high end
-  if(cal_valid && cal_dutyB_max >= dutyB_min_phys){
+  if(cal_valid && !window_bypass && cal_dutyB_max >= dutyB_min_phys){
     dutyB_max_phys = cal_dutyB_max; // trust measured upper bound
     if(dutyB_max_phys < dutyB_min_phys) dutyB_max_phys = dutyB_min_phys;
   }
+  // Validate calibrated span: if too narrow (<2% duty) treat calibration as invalid
+  if(cal_valid && !window_bypass && (dutyB_max_phys - dutyB_min_phys) < 2.0f){
+    cal_warn_span_small = true; cal_valid = false; // ignore override
+  }
+  // If floor was already too high to reach node_v_min, never apply calibration override
+  if(cal_warn_floor_high || window_bypass){ cal_valid = false; }
   if (dutyB_max_phys <= dutyB_min_phys){
     // Collapsed window → any logical value maps to min
     dutyB_tgt_phys = dutyB_min_phys;
@@ -249,8 +387,20 @@ void updateControl(){
     dutyB_tgt_phys = dutyB_min_phys + (dutyB_max_phys - dutyB_min_phys)*normL;
   }
 
+  // Overshoot feedback clamp: if measured node already above max+margin, pull target down gradually
+  const float OVERSHOOT_HYST = 0.006f; // small margin to avoid chatter
+  if(vfan_meas > 0 && vfan_meas >= (node_v_max + OVERSHOOT_HYST)){
+    // Scale back proportionally to overshoot fraction
+    float excess = vfan_meas - node_v_max;
+    float spanV  = (node_v_max - node_v_min);
+    float scale  = 1.0f - clamp01(excess / (spanV>0?spanV:0.10f)); // up to 100% cut if huge overshoot
+    dutyB_tgt_phys *= scale;
+    if(dutyB_tgt_phys < dutyB_min_phys) dutyB_tgt_phys = dutyB_min_phys; // don't invert ordering
+  }
+
   // Slew limit (50 ms loop) on PHYSICAL duty
-  static float dutyB = 100;                 // boot safe
+  static float dutyB = 0;                   // start from 0 to prevent lift pulse
+  static bool firstLoop=true;               // guard for initial write
   float delta = dutyB_tgt_phys - dutyB;
   float step  = (50.0f / attack_ms);        // % per tick
   if      (delta >  step) dutyB += step;
@@ -258,13 +408,25 @@ void updateControl(){
   else                    dutyB  = dutyB_tgt_phys;
   dutyB_now = dutyB;
 
-  // Apply PWMs
-  ledcWrite(PWM_CH_A, toDutyCounts(floor_pct));
-  ledcWrite(PWM_CH_B, toDutyCounts(dutyB));
+  // Apply PWMs (skip slew artifact first iteration)
+  if(firstLoop){
+    ledcWrite(PWM_CH_A, toDutyCounts(floor_pct));
+    ledcWrite(PWM_CH_B, toDutyCounts(dutyB));
+    firstLoop=false;
+  } else {
+    ledcWrite(PWM_CH_A, toDutyCounts(floor_pct));
+    ledcWrite(PWM_CH_B, toDutyCounts(dutyB));
+  }
 
   // Model fan node voltage (for display)
   float VB=3.3f*(dutyB/100.0f);
-  vfan_model = (VA/R_A + VB/R_B) / (1.0f/R_A + 1.0f/R_B);
+  if(model_learned){
+    vfan_pred_raw = v_bias + wA_eff*VA + wB_eff*VB; // unscaled
+    vfan_model = v_bias + learn_alpha * (wA_eff*VA + wB_eff*VB);
+  } else {
+    vfan_pred_raw = (VA/R_A + VB/R_B) / (1.0f/R_A + 1.0f/R_B);
+    vfan_model = vfan_pred_raw;
+  }
 
   // Measure fan node via GPIO3 feedback (factory-calibrated path then trimmed)
   {
@@ -279,6 +441,7 @@ void updateControl(){
 
   // -------- Auto-Calibration State Machine (overrides outputs while active) --------
   if(ac_state != AC_IDLE && ac_state != AC_DONE && ac_state != AC_ERROR){
+    alpha_adapt_enabled = false; // freeze adaptation during active calibration
     unsigned long now = millis();
     // Adaptive settle: longer early, shorter as bracket narrows
     auto adaptiveSettle = [&](float span)->unsigned long {
@@ -289,17 +452,66 @@ void updateControl(){
       return 100; };
     switch(ac_state){
       case AC_P1_SET: {
-        ac_iter_floor=0; ac_floor_lo=5.0f; ac_floor_hi=80.0f; ac_floor_mid=floor_pct; if(ac_floor_mid<5||ac_floor_mid>80) ac_floor_mid=32.0f;
+        // Start floor search at 0 so we can measure true baseline.
+        // Capture extra settle if previous runtime floor_pct was high (allow node to discharge)
+        ac_iter_floor=0; ac_floor_lo=0.0f; ac_floor_hi=80.0f; ac_floor_mid=0.0f; ac_baseline_retry=false;
+        // Heuristic: extra settle (ms) proportional to prior floor (0..500ms)
+        ac_extra_settle_ms = (unsigned long)(floor_pct * 7.0f); if(ac_extra_settle_ms>500) ac_extra_settle_ms=500;
+        // Force immediate 0 output on both channels to guarantee discharge before first baseline sample
+        ledcWrite(PWM_CH_A, toDutyCounts(0));
+        ledcWrite(PWM_CH_B, toDutyCounts(0));
+        dutyB_now=0;
+        if(Serial){ Serial.printf("[AutoCal] P1_SET discharge pre-baseline (prev floor=%.2f%%, extra=%lums)\n", floor_pct, ac_extra_settle_ms); }
         ac_target_min = node_v_min; ac_step_time=now; ac_state=AC_P1_WAIT; break; }
       case AC_P1_WAIT: {
         unsigned long need = adaptiveSettle(ac_floor_hi - ac_floor_lo);
+        if(ac_iter_floor==0 && !ac_baseline_retry){ need += ac_extra_settle_ms; }
         if(now - ac_step_time >= need){ ac_state=AC_P1_EVAL; }
         break; }
       case AC_P1_EVAL: {
-        ac_last_v = readFanNodeAveraged(6);
+        // Median-of-3 sampling for robust baseline / floor evaluation
+        auto sampleMedian3 = [&](){
+          float s1 = readFanNodeAveraged(6); delay(8);
+          float s2 = readFanNodeAveraged(6); delay(8);
+          float s3 = readFanNodeAveraged(6);
+          float a=s1,b=s2,c=s3; // manual median
+          if(a>b) std::swap(a,b); if(b>c) std::swap(b,c); if(a>b) std::swap(a,b);
+          if(Serial && ac_iter_floor==0){
+            if(!ac_baseline_retry) Serial.printf("[AutoCal] Baseline samples: %.3f %.3f %.3f median=%.3f\n", s1,s2,s3,b);
+            else Serial.printf("[AutoCal] Baseline RETRY samples: %.3f %.3f %.3f median=%.3f\n", s1,s2,s3,b);
+          }
+          return b; };
+        ac_last_v = sampleMedian3();
+        if(ac_iter_floor==0){ cal_baseline_v = ac_last_v; }
+        cal_baseline_meas = ac_last_v;
+        const float MARGIN_LOW  = 0.010f; // 10 mV hysteresis
+        const float MARGIN_HIGH = 0.015f; // widened slightly to reduce false-high aborts
+        // Classify baseline when floor_mid currently represents candidate floor (starts at 0)
+        if(ac_iter_floor==0){
+          if(ac_floor_mid <= 0.05f){ // effectively zero floor
+            if(ac_last_v > node_v_max + MARGIN_HIGH){
+              if(!ac_baseline_retry){
+                // One retry: maybe residual charge from prior high floor. Force extra wait and sample again.
+                ac_baseline_retry=true; ac_step_time=now; // re-enter WAIT with added fixed delay
+                ac_extra_settle_ms = 400; // fixed second settle window
+                Serial.println("[AutoCal] Baseline high on first sample -> retry after extra settle");
+                ac_state=AC_P1_WAIT; break; }
+              // Second time still high: treat as impossible
+              win_impossible = true; cal_valid=false; cal_dutyB_max=-1; ac_error_msg = "baseline>node_v_max"; ac_state = AC_ERROR; break; }
+            if(ac_last_v >= node_v_min - MARGIN_LOW && ac_last_v <= node_v_max + MARGIN_HIGH){
+              // Baseline lies inside desired window -> accept floor=0, skip raising search
+              floor_pct = 0.0f; ac_state = AC_P2_SET; break; }
+            // Else baseline below node_v_min -> need to raise floor via binary search
+            ac_floor_lo = 0.0f; ac_floor_hi = MAX_CAL_FLOOR_PCT; ac_floor_mid = (ac_floor_lo + ac_floor_hi)/2.0f; ac_iter_floor++; ac_step_time=now; ac_state=AC_P1_WAIT; break;
+          }
+        }
+        // Standard floor search path (we are adjusting floor to bring baseline up to node_v_min)
+        if(ac_floor_mid > MAX_CAL_FLOOR_PCT){
+          floor_pct = MAX_CAL_FLOOR_PCT; cal_warn_floor_high = true; ac_state = AC_P2_SET; break; }
+        // Convergence or iteration cap relative to target min
         if(fabs(ac_last_v - ac_target_min) < 0.003f || ac_iter_floor>=AC_MAX_ITER){
-          floor_pct = ac_floor_mid; // lock
-          ac_state = AC_P2_SET; break; }
+          floor_pct = ac_floor_mid; ac_state = AC_P2_SET; break; }
+        // Binary search adjust
         if(ac_last_v > ac_target_min){ ac_floor_hi = ac_floor_mid; } else { ac_floor_lo = ac_floor_mid; }
         ac_floor_mid = (ac_floor_lo + ac_floor_hi)/2.0f; ac_iter_floor++; ac_step_time=now; ac_state=AC_P1_WAIT; break; }
       case AC_P2_SET: {
@@ -311,17 +523,39 @@ void updateControl(){
         break; }
       case AC_P2_EVAL: {
         ac_last_v = readFanNodeAveraged(6);
+        if(ac_last_v > node_v_max + 0.35f){ cal_warn_overshoot=true; }
         if(fabs(ac_last_v - ac_target_max) < 0.003f || ac_iter_lift>=AC_MAX_ITER){
-          cal_dutyB_max = ac_lift_mid; cal_valid=true; ac_state=AC_DONE;
-          // Persist results
-          prefs.begin("fan", false);
-          prefs.putFloat("floor_pct", floor_pct);
-          prefs.putFloat("cal_dutyB_max", cal_dutyB_max);
-          prefs.putBool("cal_valid", true);
-          prefs.end();
-          break; }
+          // Enter validation phase: hold floor_pct and cal_dutyB_max for 5s stability test
+          ac_validate_start_ms = millis(); ac_validate_ref_v = ac_last_v; ac_validate_accum_ms = 0; ac_state = AC_VALIDATE; break; }
         if(ac_last_v > ac_target_max){ ac_lift_hi = ac_lift_mid; } else { ac_lift_lo = ac_lift_mid; }
         ac_lift_mid = (ac_lift_lo + ac_lift_hi)/2.0f; ac_iter_lift++; ac_step_time=now; ac_state=AC_P2_WAIT; break; }
+      case AC_VALIDATE: {
+        // Periodically sample to confirm stability near target
+        if(millis() - ac_step_time >= AC_VALIDATE_SAMPLE_INTERVAL_MS){
+          ac_last_v = readFanNodeAveraged(6);
+          ac_step_time = millis();
+          float dv = fabs(ac_last_v - ac_validate_ref_v);
+          if(dv <= AC_VALIDATE_TOL){
+            ac_validate_accum_ms += AC_VALIDATE_SAMPLE_INTERVAL_MS;
+          } else {
+            // Reset stability accumulation; adjust reference slightly toward new value (drift tracking)
+            ac_validate_ref_v = 0.70f*ac_validate_ref_v + 0.30f*ac_last_v;
+            ac_validate_accum_ms = 0;
+          }
+          // Abort if we drift out of acceptable window entirely (lost control)
+          if(ac_last_v < node_v_min - 0.015f || ac_last_v > node_v_max + 0.020f){
+            cal_valid = false; cal_dutyB_max = -1; ac_state = AC_ERROR; ac_error_msg = "validation drift"; break; }
+          // Complete validation
+          if(ac_validate_accum_ms >= AC_VALIDATE_REQUIRED_MS){
+            cal_valid = true; ac_state = AC_DONE;
+            prefs.begin("fan", false);
+            prefs.putFloat("floor_pct", floor_pct);
+            prefs.putFloat("cal_dutyB_max", cal_dutyB_max);
+            prefs.putBool("cal_valid", true);
+            prefs.end();
+          }
+        }
+        break; }
       default: break;
     }
     // Logging after state change (concise)
@@ -331,7 +565,8 @@ void updateControl(){
         Serial.printf("[AutoCal] state=%d floor_mid=%.2f lift_mid=%.2f v=%.3f itF=%d itL=%d\n", (int)ac_state, ac_floor_mid, ac_lift_mid, ac_last_v, ac_iter_floor, ac_iter_lift);
         lastLogged=ac_state; lastLogMs=millis();
       }
-      if(ac_state==AC_DONE){ Serial.printf("[AutoCal] DONE floor=%.2f dutyB_max=%.2f\n", floor_pct, cal_dutyB_max); }
+  if(ac_state==AC_VALIDATE){ Serial.printf("[AutoCal] VALIDATE hold floor=%.2f dutyB=%.2f ref=%.3f\n", floor_pct, cal_dutyB_max, ac_validate_ref_v); }
+  if(ac_state==AC_DONE){ Serial.printf("[AutoCal] DONE floor=%.2f dutyB_max=%.2f\n", floor_pct, cal_dutyB_max); }
       if(ac_state==AC_ERROR){ Serial.printf("[AutoCal] ERROR %s\n", ac_error_msg.c_str()); }
     }
     // Timeout / error
@@ -349,6 +584,32 @@ void updateControl(){
       ledcWrite(PWM_CH_B, toDutyCounts(ac_lift_mid));
       dutyB_now = ac_lift_mid; return; }
     // If done or error we fall through to normal mapping using results (if any)
+  }
+  else {
+    // Calibration inactive: if it just finished, evaluate results and unfreeze adaptation
+    if(!alpha_adapt_enabled){ alpha_adapt_enabled=true; }
+    // Floor guard after phase1: if calibration completed but floor too low vs target
+    if(ac_state==AC_DONE && cal_valid){
+      // Verify floor actually near node_v_min
+      float v_check = readFanNodeAveraged(4);
+      cal_baseline_meas = v_check;
+      if(v_check < node_v_min - 0.02f){
+        cal_warn_floor_low = true; cal_valid=false; cal_dutyB_max=-1; // invalidate
+      }
+      // Reject microscopic span
+      if(cal_valid && cal_dutyB_max >=0){
+        if(cal_dutyB_max < 5.0f){ cal_warn_span_small=true; cal_valid=false; cal_dutyB_max=-1; }
+      }
+      // Clear measurement baseline if it disproves compression
+      if(cal_baseline_meas > 0 && cal_baseline_meas < node_v_min - BASELINE_RECHECK_MARGIN){ cal_baseline_meas = 0; }
+    }
+  }
+
+  // Alpha adaptation gating: disable if suspect compression or near saturation
+  if(alpha_adapt_enabled){
+    bool nearFull = (cal_valid && cal_dutyB_max > FULL_LIFT_WARN_THRESH && dutyB_now > (cal_dutyB_max - 1.0f));
+    bool suspectCompression = (win_comp_low && cal_baseline_meas>0 && cal_baseline_meas < node_v_min - BASELINE_RECHECK_MARGIN);
+    if(nearFull || suspectCompression){ alpha_adapt_enabled=false; }
   }
 
   // Log every second
@@ -656,6 +917,11 @@ void handleDefaults(){
 }
 
 void handleSet(){
+  // Capture originals for change summary
+  float o_vin_min_v = vin_min_v, o_vin_max_v = vin_max_v, o_floor_pct = floor_pct, o_lift_span=lift_span, o_fan_max=fan_max;
+  float o_attack_ms=attack_ms, o_temp_fail=temp_fail, o_node_v_min=node_v_min, o_node_v_max=node_v_max;
+  float o_cal_vin_off=cal_vin_off, o_cal_vin_gain=cal_vin_gain, o_cal_vfan_off=cal_vfan_off, o_cal_vfan_gain=cal_vfan_gain;
+  bool  o_use_temp_mode = use_temp_mode; // currently not settable via /set, but keep pattern
   // read args
   // test_v removed
   if(server.hasArg("vin_min_v"))vin_min_v=server.arg("vin_min_v").toFloat();
@@ -671,6 +937,15 @@ void handleSet(){
   if(server.hasArg("cal_vin_gain")) cal_vin_gain= server.arg("cal_vin_gain").toFloat();
   if(server.hasArg("cal_vfan_off")) cal_vfan_off= server.arg("cal_vfan_off").toFloat();
   if(server.hasArg("cal_vfan_gain"))cal_vfan_gain=server.arg("cal_vfan_gain").toFloat();
+  // Optional calibration injection via /set
+  if(server.hasArg("cal_dutyB_max")){
+    float v = server.arg("cal_dutyB_max").toFloat();
+    if(v>=0 && v<=100){ cal_dutyB_max = v; }
+  }
+  if(server.hasArg("cal_valid")){
+    String v = server.arg("cal_valid"); v.toLowerCase();
+    if(v=="1"||v=="true"||v=="yes") cal_valid=true; else if(v=="0"||v=="false"||v=="no") cal_valid=false;
+  }
   bool anyCurveProvided=false;
   bool anyNonZero=false;
   float new_t[5];
@@ -720,7 +995,7 @@ void handleSet(){
     }
   }
 
-  floor_pct = sane(floor_pct, 10.0f, 60.0f, D.floor_pct);
+  floor_pct = sane(floor_pct, 0.0f, 60.0f, D.floor_pct);
   lift_span = sane(lift_span, 0.0f,  60.0f, D.lift_span);
   fan_max   = sane(fan_max,   10.0f, 100.0f, D.fan_max);
   attack_ms = sane(attack_ms, 20.0f, 4000.0f, D.attack_ms);
@@ -756,6 +1031,28 @@ void handleSet(){
   }
   prefs.putBool("mode",use_temp_mode);
   prefs.end();
+  // Build concise serial echo of what changed (only keys supplied)
+  if(Serial){
+    String msg = "[/set]";
+    auto appendIf=[&](const char* key,bool hadArg,float oldVal,float newVal,int prec){ if(hadArg){ msg += " "; msg += key; msg += "="; msg += String(newVal,prec); if(fabs(newVal-oldVal)>0.0005f){} else { msg+="(=)"; } } };
+    appendIf("vin_min_v", server.hasArg("vin_min_v"), o_vin_min_v, vin_min_v, 3);
+    appendIf("vin_max_v", server.hasArg("vin_max_v"), o_vin_max_v, vin_max_v, 3);
+    appendIf("floor_pct", server.hasArg("floor_pct"), o_floor_pct, floor_pct, 1);
+    appendIf("lift_span", server.hasArg("lift_span"), o_lift_span, lift_span, 1);
+    appendIf("fan_max", server.hasArg("fan_max"), o_fan_max, fan_max, 1);
+    appendIf("attack_ms", server.hasArg("attack_ms"), o_attack_ms, attack_ms, 0);
+    appendIf("temp_fail", server.hasArg("temp_fail"), o_temp_fail, temp_fail, 1);
+    appendIf("node_v_min", server.hasArg("node_v_min"), o_node_v_min, node_v_min, 3);
+    appendIf("node_v_max", server.hasArg("node_v_max"), o_node_v_max, node_v_max, 3);
+    appendIf("cal_vin_off", server.hasArg("cal_vin_off"), o_cal_vin_off, cal_vin_off, 3);
+    appendIf("cal_vin_gain", server.hasArg("cal_vin_gain"), o_cal_vin_gain, cal_vin_gain, 3);
+    appendIf("cal_vfan_off", server.hasArg("cal_vfan_off"), o_cal_vfan_off, cal_vfan_off, 3);
+    appendIf("cal_vfan_gain", server.hasArg("cal_vfan_gain"), o_cal_vfan_gain, cal_vfan_gain, 3);
+    if(anyCurveProvided){
+      if(!anyNonZero) msg += " curve=ignored_all_zero"; else msg += " curve=updated"; }
+    if(msg=="[/set]") msg += " no_changes";
+    Serial.println(msg);
+  }
 
   server.send(200,"text/plain","OK");
   // Reset auto event flag after explicit user save
@@ -764,9 +1061,13 @@ void handleSet(){
 
 void handleJson(){
   if(Serial){
-    Serial.print("/json curve pts T:");
-    for(int i=0;i<5;i++){Serial.print(temp_pt[i]);Serial.print(i<4?',':' ');}Serial.print(" F:");
-    for(int i=0;i<5;i++){Serial.print(fan_pt[i]);Serial.print(i<4?',':' ');}Serial.println();
+  // Removed verbose curve point printing to reduce serial spam during frequent /json polling.
+  // If needed for debugging, define DEBUG_JSON_SERIAL before including this file.
+  #ifdef DEBUG_JSON_SERIAL
+  Serial.print("/json curve pts T:");
+  for(int i=0;i<5;i++){ Serial.print(temp_pt[i]); Serial.print(i<4?',':' ');} Serial.print(" F:");
+  for(int i=0;i<5;i++){ Serial.print(fan_pt[i]); Serial.print(i<4?',':' ');} Serial.println();
+  #endif
   }
   String j="{";
   // Determine if curve appears intentionally populated (not all zeros)
@@ -787,12 +1088,36 @@ void handleJson(){
   j+="\"ac_state\":"+String((int)ac_state)+",";
   j+="\"ac_valid\":"+String(cal_valid?"true":"false")+",";
   j+="\"ac_duty_max\":"+String(cal_dutyB_max,1)+",";
+  j+="\"cal_baseline_v\":"+String(cal_baseline_v,3)+",";
   j+="\"curve_ok\":" + String(curve_ok?"true":"false") + ","; // flag for UI to decide retry/fallback
   if (tempValid(temp_hot))   j+="\"temp0\":"+String(temp_hot,1)+","; else j+="\"temp0\":null,";
   if (tempValid(temp_other)) j+="\"temp1\":"+String(temp_other,1)+","; else j+="\"temp1\":null,";
   j+="\"dscount\":"+String(ds_count)+",";
   j+="\"mode\":" + String(use_temp_mode ? "true" : "false") + ",";
   j+="\"fail\":" + String(fan_fail ? "true" : "false") + ",";
+  j+="\"win_impossible\":" + String(win_impossible?"true":"false") + ",";
+  j+="\"cal_warn_floor_high\":" + String(cal_warn_floor_high?"true":"false") + ",";
+  j+="\"cal_warn_span_small\":" + String(cal_warn_span_small?"true":"false") + ",";
+  j+="\"cal_warn_floor_low\":" + String(cal_warn_floor_low?"true":"false") + ",";
+  j+="\"cal_warn_overshoot\":" + String(cal_warn_overshoot?"true":"false") + ",";
+  j+="\"cal_warn_lift_near_full\":" + String(cal_warn_lift_near_full?"true":"false") + ",";
+  j+="\"cal_baseline_meas\":" + String(cal_baseline_meas,3) + ",";
+  j+="\"window_bypass\":" + String(window_bypass?"true":"false") + ",";
+  j+="\"window_bypass_force\":" + String(window_bypass_force?"true":"false") + ",";
+  j+="\"raw_override\":" + String(raw_override?"true":"false") + ",";
+  if(raw_override){ j+="\"raw_dutyA\":"+String(raw_dutyA,1)+","; j+="\"raw_dutyB\":"+String(raw_dutyB,1)+","; }
+  j+="\"model_learned\":" + String(model_learned?"true":"false") + ",";
+  j+="\"v_bias\":" + String(v_bias,3) + ",";
+  j+="\"wA_eff\":" + String(wA_eff,4) + ",";
+  j+="\"wB_eff\":" + String(wB_eff,4) + ",";
+  j+="\"model_alpha\":" + String(learn_alpha,3) + ",";
+  j+="\"model_alpha_set\":" + String(learn_alpha_set?"true":"false") + ",";
+  j+="\"model_pred_raw\":" + String(vfan_pred_raw,3) + ",";
+  // debug instrumentation
+  j+="\"dbg_VA\":"+String(dbg_VA,3)+",";
+  j+="\"dbg_VB\":"+String(dbg_VB,3)+",";
+  j+="\"dbg_VB_needed\":"+String(dbg_VB_needed,3)+",";
+  j+="\"dbg_vnode\":"+String(dbg_vnode,3)+",";
   // current config for first-time UI fill
   j+="\"config\":{";
   // test_v removed from config object
@@ -847,6 +1172,14 @@ void handleFactory(){
   ESP.restart();
 }
 
+void handleReboot(){
+  // Soft reboot (no preference clearing)
+  server.send(200, "text/plain", "Rebooting...");
+  if(Serial) Serial.println("[SYS] Reboot requested (no reset)");
+  delay(150);
+  ESP.restart();
+}
+
 void handleAutoCal(){
   if(server.hasArg("stop")){
     if(ac_state!=AC_IDLE){ ac_state=AC_IDLE; server.send(200,"text/plain","Cancelled"); }
@@ -854,6 +1187,8 @@ void handleAutoCal(){
     if(Serial){ Serial.println("[AutoCal] Stop request -> set state IDLE"); }
     return; }
   if(ac_state!=AC_IDLE && ac_state!=AC_DONE && ac_state!=AC_ERROR){ server.send(200,"text/plain","Already running"); return; }
+  // Ensure raw override is disabled so calibration sees real baseline
+  if(raw_override){ raw_override=false; raw_dutyA=0; raw_dutyB=0; if(Serial) Serial.println("[AutoCal] Clearing raw_override before start"); }
   ac_state = AC_P1_SET; cal_valid=false; cal_dutyB_max=-1; ac_error_msg=""; ac_step_time=millis();
   if(Serial){ Serial.printf("[AutoCal] START  node_v_min=%.3f node_v_max=%.3f floor_pct=%.2f dutyB_now=%.2f\n", node_v_min, node_v_max, floor_pct, dutyB_now); }
   server.send(200,"text/plain","Started");
@@ -889,15 +1224,17 @@ void setup(){
   ledcAttachPin(PIN_PWM_B, PWM_CH_B);
   Serial.printf("LEDC timers: A=%.1f Hz, B=%.1f Hz (res=%d bits)\n", fA, fB, PWM_RES_BITS);
 
-  // Safe baseline immediately (prevents 0% at boot)
+  // Apply initial floor only; keep lift at 0 to avoid startup pulse
   ledcWrite(PWM_CH_A, toDutyCounts(floor_pct));
-  ledcWrite(PWM_CH_B, toDutyCounts(100));     // full lift until control loop runs once
+  ledcWrite(PWM_CH_B, toDutyCounts(0));
 
   sensors.begin();
 
   // Load saved params
   prefs.begin("fan",true);
   // load test_v removed
+  bool have_floor = prefs.isKey("floor_pct");
+  bool have_node_min = prefs.isKey("node_v_min");
   vin_min_v=prefs.getFloat("vin_min_v",vin_min_v);
   vin_max_v=prefs.getFloat("vin_max_v",vin_max_v);
   floor_pct=prefs.getFloat("floor_pct",floor_pct);
@@ -916,7 +1253,46 @@ void setup(){
   }
   cal_dutyB_max = prefs.getFloat("cal_dutyB_max", cal_dutyB_max);
   cal_valid     = prefs.getBool("cal_valid", false);
+  v_bias        = prefs.getFloat("v_bias", v_bias);
+  wA_eff        = prefs.getFloat("wA_eff", wA_eff);
+  wB_eff        = prefs.getFloat("wB_eff", wB_eff);
+  cal_baseline_meas = prefs.getFloat("cal_baseline_meas", cal_baseline_meas);
+  model_learned = prefs.getBool("model_learned", model_learned);
+  learn_alpha   = prefs.getFloat("learn_alpha", learn_alpha);
+  if(learn_alpha < 0.1f || learn_alpha > 1.2f) learn_alpha = 1.0f; // sanity
+  learn_alpha_last_saved = learn_alpha;
+  learn_alpha_frozen = prefs.getBool("alpha_frozen", false);
   prefs.end();
+
+  // If factory reset (no keys) ensure updated defaults applied & optionally persist once so subsequent boots stable
+  if(!have_floor){
+    Serial.printf("[BOOT] floor_pct missing -> using default %.2f\n", D.floor_pct);
+    floor_pct = D.floor_pct;
+  }
+  // node_v_min is not separately loaded earlier (still initial D.node_v_min unless a /set changed and persisted via node_v_min key)
+  // Load persisted node window if exists
+  prefs.begin("fan", true);
+  node_v_min = prefs.getFloat("node_v_min", node_v_min);
+  node_v_max = prefs.getFloat("node_v_max", node_v_max);
+  prefs.end();
+  if(!have_node_min){
+    // Ensure default from struct (may have been updated by user code change)
+    node_v_min = D.node_v_min; node_v_max = D.node_v_max; // keep max default
+    Serial.printf("[BOOT] node_v_min missing -> using defaults min=%.3f max=%.3f\n", node_v_min, node_v_max);
+  }
+  // Optionally auto-persist new defaults if missing keys (one-time write)
+  if(!have_floor || !have_node_min){
+    prefs.begin("fan", false);
+    if(!have_floor) prefs.putFloat("floor_pct", floor_pct);
+    if(!have_node_min){ prefs.putFloat("node_v_min", node_v_min); prefs.putFloat("node_v_max", node_v_max); }
+    prefs.end();
+    Serial.println("[BOOT] Persisted updated defaults (first-run or post-factory)");
+  }
+  Serial.printf("[BOOT] Effective defaults: floor_pct=%.2f node_v_min=%.3f node_v_max=%.3f\n", floor_pct, node_v_min, node_v_max);
+  if(cal_baseline_meas>0){
+    // Already have a baseline -> no need for capture
+    boot_baseline_pending=false; Serial.printf("[BOOT] Existing baseline meas=%.3fV (pending disabled)\n", cal_baseline_meas);
+  }
 
   // Sanitize & enforce small gap without hard reset
   vin_min_v = sane(vin_min_v, 0.40f, 1.20f, D.vin_min_v);
@@ -933,6 +1309,7 @@ void setup(){
   server.on("/toggle",handleToggle);
   server.on("/defaults",handleDefaults);
   server.on("/factory",handleFactory);
+  server.on("/reboot",handleReboot);
   server.on("/autocal",handleAutoCal);
   server.begin();
 }
@@ -943,31 +1320,50 @@ void loop(){
   // Commands:
   //   dump      -> human readable multi-line snapshot
   //   dumpjson  -> single-line JSON with all parameters + live values
+  //   save      -> persist current runtime config + calibration + model learn params
   // (future) other commands can be added here.
   if(Serial && Serial.available()){
-    static char cmdBuf[48];
+    static char cmdBuf[64];
     static uint8_t idx=0;
+    static String lastRawLine=""; // retain full raw line for argument parsing
     while(Serial.available()){
       char c=Serial.read();
-      if(c=='\r') continue; // ignore CR
+      // Handle CRLF / LF / CR uniformly: treat either as terminator
+      if(c=='\r'){
+        // look ahead for immediate '\n' to consume CRLF pair without generating two executions
+        if(Serial.peek()=='\n'){ Serial.read(); }
+        c='\n';
+      }
+      if(c=='\b' || c==127){ // backspace or DEL
+        if(idx>0){ idx--; if(Serial){ Serial.print("\b \b"); } }
+        continue;
+      }
       if(c=='\n'){
+        // terminate current buffer
         cmdBuf[idx]='\0';
         String cmd = String(cmdBuf);
-        cmd.trim();
+        lastRawLine = String(cmdBuf); // store raw pre-trim
+        // Echo newline (CRLF style) so prompt moves
+        if(Serial) Serial.print("\r\n");
         idx=0;
-        if(cmd.length()==0) break;
+        cmd.trim();
+        if(cmd.length()==0) continue; // ignore empty line
         if(cmd.equalsIgnoreCase("dump") || cmd.equalsIgnoreCase("d")){
           Serial.println("=== DUMP (human) ===");
           Serial.printf("Mode: %s  Fail:%s  Sensors:%d\n", use_temp_mode?"TEMP":"PS4", fan_fail?"YES":"no", ds_count);
           Serial.printf("Temps: hot=%.2f other=%s  temp_fail=%.1f\n", temp_hot, tempValid(temp_other)?String(temp_other,2).c_str():"n/a", temp_fail);
           Serial.printf("Vin: now=%.3f (min=%.3f max=%.3f) cal_off=%.3f cal_gain=%.3f\n", vin_now, vin_min_v, vin_max_v, cal_vin_off, cal_vin_gain);
             Serial.printf("FanNode: model=%.3f meas=%.3f (win=%.3f..%.3f) cal_off=%.3f cal_gain=%.3f\n", vfan_model, vfan_meas, node_v_min, node_v_max, cal_vfan_off, cal_vfan_gain);
+            Serial.printf("Dbg: VA=%.3f VB=%.3f VB_need=%.3f vnode=%.3f\n", dbg_VA, dbg_VB, dbg_VB_needed, dbg_vnode);
           Serial.printf("Floor=%.2f%%  LiftSpan=%.2f%%  FanMax=%.2f%%  Attack=%.0fms\n", floor_pct, lift_span, fan_max, attack_ms);
           Serial.printf("DutyB: now=%.2f%% window=%.2f%%..%.2f%% (flags: L=%d H=%d !=%d autoF=%d)\n", dutyB_now, dutyB_min_phys, dutyB_max_phys, win_comp_low, win_comp_high, win_invalid, floor_auto_event);
-          Serial.printf("AutoCal: state=%d valid=%d dutyB_max=%.2f lastV=%.3f floor_mid=%.2f lift_mid=%.2f itF=%d itL=%d\n", (int)ac_state, cal_valid, cal_dutyB_max, ac_last_v, ac_floor_mid, ac_lift_mid, ac_iter_floor, ac_iter_lift);
+          Serial.printf("WinFlags: impossible=%d calWarnFloorHigh=%d calWarnSpanSmall=%d\n", win_impossible, cal_warn_floor_high, cal_warn_span_small);
+          Serial.printf("AutoCal: state=%d valid=%d dutyB_max=%.2f lastV=%.3f floor_mid=%.2f lift_mid=%.2f baseV=%.3f itF=%d itL=%d\n", (int)ac_state, cal_valid, cal_dutyB_max, ac_last_v, ac_floor_mid, ac_lift_mid, cal_baseline_v, ac_iter_floor, ac_iter_lift);
           Serial.print("Curve T->F: ");
           for(int i=0;i<5;i++){ Serial.printf("%.1f->%.1f%s", temp_pt[i], fan_pt[i], (i<4)?", ":"\n"); }
           Serial.println("=== END ===");
+        } else if(cmd.equalsIgnoreCase("help") || cmd.equalsIgnoreCase("h")){
+          Serial.println("Commands: dump(d) dumpjson(dj) save ac acstop calreset calinject floor= dutyB= acstop alphafreeze [val] alphafreeclear raw [off|a= b=] bypass [on|off] set key=val learn history fh fasthist factory reboot restart toggle calreset calreset help");
         } else if(cmd.equalsIgnoreCase("dumpjson") || cmd.equalsIgnoreCase("dj")){
           // produce single-line JSON for machine ingest
           String j="{";
@@ -994,6 +1390,7 @@ void loop(){
           j+="\"floor_auto_event\":"+String(floor_auto_event?"true":"false")+",";
           j+="\"cal_valid\":"+String(cal_valid?"true":"false")+",";
           j+="\"cal_dutyB_max\":"+String(cal_dutyB_max,2)+",";
+          j+="\"cal_baseline_v\":"+String(cal_baseline_v,3)+",";
           j+="\"ac_state\":"+String((int)ac_state)+",";
           j+="\"ac_floor_mid\":"+String(ac_floor_mid,2)+",";
           j+="\"ac_lift_mid\":"+String(ac_lift_mid,2)+",";
@@ -1005,17 +1402,60 @@ void loop(){
           j+="\"cal_vin_gain\":"+String(cal_vin_gain,3)+",";
           j+="\"cal_vfan_off\":"+String(cal_vfan_off,3)+",";
           j+="\"cal_vfan_gain\":"+String(cal_vfan_gain,3)+",";
+          j+="\"win_impossible\":"+String(win_impossible?"true":"false")+",";
+          j+="\"cal_warn_floor_high\":"+String(cal_warn_floor_high?"true":"false")+",";
+          j+="\"cal_warn_span_small\":"+String(cal_warn_span_small?"true":"false")+",";
+          j+="\"cal_warn_floor_low\":"+String(cal_warn_floor_low?"true":"false")+",";
+          j+="\"cal_warn_overshoot\":"+String(cal_warn_overshoot?"true":"false")+",";
+          j+="\"window_bypass\":"+String(window_bypass?"true":"false")+",";
+          j+="\"window_bypass_force\":"+String(window_bypass_force?"true":"false")+",";
+          j+="\"raw_override\":"+String(raw_override?"true":"false")+",";
+          if(raw_override){ j+="\"raw_dutyA\":"+String(raw_dutyA,2)+","; j+="\"raw_dutyB\":"+String(raw_dutyB,2)+","; }
+          j+="\"dbg_VA\":"+String(dbg_VA,3)+",";
+          j+="\"dbg_VB\":"+String(dbg_VB,3)+",";
+          j+="\"dbg_VB_needed\":"+String(dbg_VB_needed,3)+",";
+          j+="\"dbg_vnode\":"+String(dbg_vnode,3)+",";
+          j+="\"model_learned\":"+String(model_learned?"true":"false")+",";
+          j+="\"model_alpha\":"+String(learn_alpha,3)+",";
+          j+="\"model_alpha_set\":"+String(learn_alpha_set?"true":"false")+",";
+          j+="\"model_pred_raw\":"+String(vfan_pred_raw,3)+",";
           j+="\"curve\":[";
           for(int i=0;i<5;i++){ j+="["+String(temp_pt[i],1)+","+String(fan_pt[i],1)+"]"; if(i<4) j+=","; }
           j+="]}";
           Serial.println(j);
+        } else if(cmd.equalsIgnoreCase("calreset")){
+          cal_valid=false; cal_dutyB_max=-1; cal_warn_span_small=false; cal_warn_floor_low=false; cal_warn_overshoot=false;
+          prefs.begin("fan", false); prefs.putBool("cal_valid", false); prefs.putFloat("cal_dutyB_max", -1); prefs.end();
+          Serial.println("[Cal] Calibration cleared");
         } else if(cmd.equalsIgnoreCase("ac")){
           if(ac_state==AC_IDLE || ac_state==AC_DONE || ac_state==AC_ERROR){
+            if(raw_override){ raw_override=false; raw_dutyA=0; raw_dutyB=0; Serial.println("[AutoCal] Clearing raw_override (serial trigger)"); }
             ac_state = AC_P1_SET; cal_valid=false; cal_dutyB_max=-1; ac_error_msg=""; ac_step_time=millis();
             Serial.println("[AutoCal] Triggered via serial");
           } else {
             Serial.println("[AutoCal] Already running");
           }
+  } else if(cmd.startsWith("calinject")){
+          // Usage: calinject floor=<pct> dutyB=<pct>
+          float nf = floor_pct; float nb = cal_dutyB_max; bool hf=false, hb=false;
+          String line = lastRawLine; // includes 'calinject ...'
+          int sp = line.indexOf(' ');
+          if(sp>0){ String rest = line.substring(sp+1); rest.trim(); int pos=0; while(pos < rest.length()){ int nxt=rest.indexOf(' ',pos); String tok=(nxt==-1)?rest.substring(pos):rest.substring(pos,nxt); tok.trim(); if(tok.length()){ int eq=tok.indexOf('='); if(eq>0){ String k=tok.substring(0,eq); String v=tok.substring(eq+1); k.toLowerCase(); v.trim(); if(k=="floor"){ nf=v.toFloat(); hf=true; } else if(k=="dutyb"||k=="b"){ nb=v.toFloat(); hb=true; } } } if(nxt==-1) break; pos=nxt+1; } }
+          if(!hf || !hb){ Serial.println("[CalInject] Usage: calinject floor=<pct> dutyB=<pct>"); }
+          else {
+            if(nf<0) nf=0; if(nf>100) nf=100; if(nb<0) nb=0; if(nb>100) nb=100;
+            floor_pct=nf; cal_dutyB_max=nb; cal_valid=true; cal_warn_span_small=false; cal_warn_floor_low=false; cal_warn_floor_high=false; cal_warn_overshoot=false;
+            prefs.begin("fan", false); prefs.putFloat("floor_pct", floor_pct); prefs.putFloat("cal_dutyB_max", cal_dutyB_max); prefs.putBool("cal_valid", true); prefs.end();
+            Serial.printf("[CalInject] Applied floor=%.2f dutyB_max=%.2f (valid)\n", floor_pct, cal_dutyB_max);
+          }
+        } else if(cmd.startsWith("alphafreeze")){
+          // alphafreeze [value]
+          String line = lastRawLine; int sp = line.indexOf(' '); if(sp>0){ String v=line.substring(sp+1); v.trim(); if(v.length()){ float val=v.toFloat(); if(val>=0.1f && val<=1.2f) learn_alpha=val; }}
+          learn_alpha_frozen=true; learn_alpha_set=true;
+          prefs.begin("fan", false); prefs.putFloat("learn_alpha", learn_alpha); prefs.putBool("alpha_frozen", true); prefs.end();
+          Serial.printf("[ALPHA] Frozen at %.3f\n", learn_alpha);
+        } else if(cmd.equalsIgnoreCase("alphafreeclear")){
+          learn_alpha_frozen=false; prefs.begin("fan", false); prefs.putBool("alpha_frozen", false); prefs.end(); Serial.println("[ALPHA] Freeze cleared (adaptation resumes)");
         } else if(cmd.equalsIgnoreCase("acstop")){
           if(ac_state!=AC_IDLE){ ac_state=AC_IDLE; Serial.println("[AutoCal] Stopped"); }
           else Serial.println("[AutoCal] Not running");
@@ -1025,6 +1465,39 @@ void loop(){
         } else if(cmd.equalsIgnoreCase("factory") || cmd.equalsIgnoreCase("wipe")){
           Serial.println("Factory wipe & reboot in 300ms...");
           prefs.begin("fan", false); prefs.clear(); prefs.end(); delay(300); ESP.restart();
+        } else if(cmd.equalsIgnoreCase("reboot") || cmd.equalsIgnoreCase("restart")){
+          Serial.println("[SYS] Rebooting (no reset) in 150ms...");
+          delay(150);
+          ESP.restart();
+        } else if(cmd.equalsIgnoreCase("save")){
+          // Persist current runtime parameters (config + calibration offsets + curve + mode + cal results + model learn params)
+          prefs.begin("fan", false);
+          prefs.putFloat("vin_min_v",vin_min_v);
+          prefs.putFloat("vin_max_v",vin_max_v);
+          prefs.putFloat("floor_pct",floor_pct);
+          prefs.putFloat("lift_span",lift_span);
+          prefs.putFloat("fan_max",fan_max);
+          prefs.putFloat("attack_ms",attack_ms);
+            prefs.putFloat("temp_fail",temp_fail);
+          prefs.putFloat("node_v_min",node_v_min);
+          prefs.putFloat("node_v_max",node_v_max);
+          prefs.putFloat("cal_vin_off",cal_vin_off);
+          prefs.putFloat("cal_vin_gain",cal_vin_gain);
+          prefs.putFloat("cal_vfan_off",cal_vfan_off);
+          prefs.putFloat("cal_vfan_gain",cal_vfan_gain);
+          for(int i=0;i<5;i++){ prefs.putFloat(("t"+String(i)).c_str(),temp_pt[i]); prefs.putFloat(("f"+String(i)).c_str(),fan_pt[i]); }
+          prefs.putBool("mode", use_temp_mode);
+          // Calibration & learned model (if available)
+          prefs.putFloat("cal_dutyB_max", cal_dutyB_max);
+          prefs.putBool("cal_valid", cal_valid);
+          prefs.putFloat("v_bias", v_bias);
+          prefs.putFloat("wA_eff", wA_eff);
+          prefs.putFloat("wB_eff", wB_eff);
+          prefs.putBool("model_learned", model_learned);
+          if(learn_alpha_set) prefs.putFloat("learn_alpha", learn_alpha);
+          prefs.end();
+          floor_auto_event=false; // considered acknowledged
+          Serial.println("[SAVE] OK (config+cal+model persisted)");
         } else if(cmd.equalsIgnoreCase("history")){
           Serial.println("[History] Most recent samples (t[s] thot vfanm duty)");
           int n=hist_count; int shown = n<20?n:20; // last up to 20
@@ -1033,7 +1506,52 @@ void loop(){
             Sample s=history[(idx + n - shown + i + HISTORY_LEN)%HISTORY_LEN];
             Serial.printf("%lu %.1f %.3f %.1f\n", s.t, s.thot, s.vfan_mea, s.duty);
           }
-        } else if(cmd.startsWith("set ")){
+        } else if(cmd.equalsIgnoreCase("fh") || cmd.equalsIgnoreCase("fasthist")){
+          // Optional argument 'all' prints full buffer, otherwise last 5s (approx)
+          Serial.println("[FastHist] t_ms v_meas v_model v_pred_raw dutyB floor alpha flags");
+          int n=fast_hist_count;
+          int maxShow = n; // default show all stored (<=6.4s)
+          // Could parse argument for 'all' vs default; currently identical
+          int start=(fast_hist_head - maxShow + FAST_HIST_LEN)%FAST_HIST_LEN;
+          for(int i=0;i<maxShow;i++){
+            FastSample &fs = fast_hist[(start + i) % FAST_HIST_LEN];
+            Serial.printf("%lu %.3f %.3f %.3f %.2f %.2f %.3f 0x%02X\n", (unsigned long)fs.t_ms, fs.v_meas, fs.v_model, fs.v_pred_raw, fs.dutyB, fs.floorPct, fs.alpha, fs.flags);
+          }
+  } else if(cmd.startsWith("raw")){
+          // raw            -> show status
+          // raw off        -> disable override
+          // raw a=30 b=55  -> set raw channel duties (percent)
+          String rest = cmd.substring(3); rest.trim();
+          if(rest.length()==0){
+            Serial.printf("RAW override %s  A=%.2f%% B=%.2f%%\n", raw_override?"ON":"off", raw_dutyA, raw_dutyB);
+          } else if(rest.equalsIgnoreCase("off")){
+            raw_override=false; Serial.println("RAW override disabled");
+          } else {
+            // parse tokens like a=.. b=..
+            float a=raw_dutyA, b=raw_dutyB; bool setA=false,setB=false;
+            while(rest.length()>0){
+              int sp=rest.indexOf(' '); String tok = (sp==-1)?rest:rest.substring(0,sp); if(sp==-1) rest=""; else rest=rest.substring(sp+1); tok.trim(); if(tok.length()==0) continue;
+              int eq=tok.indexOf('='); if(eq<=0) continue; String k=tok.substring(0,eq); String v=tok.substring(eq+1); k.trim(); v.trim(); float f=v.toFloat();
+              if(k.equalsIgnoreCase("a")){ a=f; setA=true; }
+              else if(k.equalsIgnoreCase("b")){ b=f; setB=true; }
+            }
+            if(setA) raw_dutyA = a; if(setB) raw_dutyB = b;
+            raw_override=true; Serial.printf("RAW override ON  A=%.2f%% B=%.2f%%\n", raw_dutyA, raw_dutyB);
+          }
+  } else if(cmd.startsWith("bypass")){
+          // bypass            -> show state
+          // bypass on|off     -> force on/off; 'off' returns to auto determination
+            String rest = cmd.substring(6); rest.trim();
+            if(rest.length()==0){
+              Serial.printf("Window bypass %s (force=%s auto=%s)\n", window_bypass?"ACTIVE":"inactive", window_bypass_force?"ON":"off", (win_invalid||cal_warn_floor_high||win_impossible)?"triggered":"clear");
+            } else if(rest.equalsIgnoreCase("on")){
+              window_bypass_force=true; Serial.println("Window bypass forced ON (full span)");
+            } else if(rest.equalsIgnoreCase("off")){
+              window_bypass_force=false; Serial.println("Window bypass force cleared (auto logic may still enable)");
+            } else {
+              Serial.println("Usage: bypass [on|off]");
+            }
+  } else if(cmd.startsWith("set ")){
           // Format: set key=value [key2=value2 ...]
           String rest = cmd.substring(4); rest.trim();
           if(rest.length()==0){ Serial.println("Usage: set key=value [key=value ...]"); }
@@ -1053,7 +1571,7 @@ void loop(){
               bool ok=true; // assume ok then sanitize
               if(key=="vin_min_v"){ vin_min_v = sane(val,0.50f,1.00f,D.vin_min_v); }
               else if(key=="vin_max_v"){ vin_max_v = sane(val,0.70f,1.20f,D.vin_max_v); }
-              else if(key=="floor_pct"){ floor_pct = sane(val,10.0f,60.0f,D.floor_pct); invalidateCal(); }
+              else if(key=="floor_pct"){ floor_pct = sane(val,0.0f,60.0f,D.floor_pct); invalidateCal(); }
               else if(key=="lift_span"){ lift_span = sane(val,0.0f,60.0f,D.lift_span); }
               else if(key=="fan_max"){ fan_max = sane(val,10.0f,100.0f,D.fan_max); }
               else if(key=="attack_ms"){ attack_ms = sane(val,20.0f,4000.0f,D.attack_ms); }
@@ -1096,48 +1614,207 @@ void loop(){
             prefs.end();
             Serial.printf("Set applied=%d rejected=%d curveChanged=%d\n", applied, rejected, curveChanged?1:0);
           }
+  } else if(cmd.equalsIgnoreCase("learn")){
+          if(raw_override){ Serial.println("[LEARN] Cannot start: raw override active"); }
+          else if(ac_state!=AC_IDLE){ Serial.println("[LEARN] Cannot start: AutoCal running"); }
+          else if(learn_state!=L_IDLE && learn_state!=L_DONE){ Serial.println("[LEARN] Already in progress"); }
+          else {
+            // Initialize sequence
+            learn_state = L_RUN_A; learn_step=0; raw_override=true; raw_dutyB=0; raw_dutyA=LEARN_SEQ_A[0];
+            ledcWrite(PWM_CH_A, toDutyCounts(raw_dutyA));
+            ledcWrite(PWM_CH_B, toDutyCounts(0));
+            learn_step_start = millis();
+            Serial.println("[LEARN] Starting characterization (A sequence)...");
+          }
         } else {
-          Serial.print("Unknown cmd: "); Serial.println(cmd);
-          Serial.println("Commands: dump | dumpjson | ac | acstop | toggle | factory | history | set");
+          Serial.print("Unknown: "); Serial.println(cmd);
+          Serial.println("Type 'help' for list.");
         }
-      } else if(idx < sizeof(cmdBuf)-1){
-        cmdBuf[idx++]=c;
+      } else if(isPrintable(c)){
+        if(idx < sizeof(cmdBuf)-1){ cmdBuf[idx++]=c; if(Serial) Serial.print(c); }
       }
     }
   }
   if (millis()-lastUpdate > 50){
+      // Boot-time automatic baseline capture: measure vnode with lift fully off (dutyB=0) at configured floor
+      // Conditions to attempt: feature pending, not already active, no calibration running, no raw override, calibration invalid OR no prior measurement
+      if(boot_baseline_pending && !boot_baseline_active && !raw_override && ac_state==AC_IDLE && cal_baseline_meas==0){
+        // Ensure lift actually at 0 (we soft-started with dutyB=0; enforce if any drift)
+        if(dutyB_now != 0){
+          ledcWrite(PWM_CH_B, toDutyCounts(0));
+          dutyB_now = 0;
+        }
+        unsigned long now=millis();
+        if(now > BOOT_BASELINE_DELAY_MS){
+          boot_baseline_active=true; boot_baseline_start=now; boot_baseline_last_sample=0; boot_baseline_count=0; Serial.println("[BOOT] Baseline capture start");
+        }
+      }
+      if(boot_baseline_active){
+        unsigned long now=millis();
+        if((boot_baseline_last_sample==0) || (now - boot_baseline_last_sample) >= BOOT_BASELINE_SAMPLE_INTERVAL_MS){
+          // Take a sample of current measured vnode (we will rely on vfan_meas smoothing, but also store raw instantaneous reading for median robustness)
+          // Perform a quick fresh multi-sample analogous to raw block for accuracy
+          const int BL_SAMPLES=5; float sum=0; for(int i=0;i<BL_SAMPLES;i++){ int mv_fb = analogReadMilliVolts(PIN_FAN_FB); sum += (mv_fb/1000.0f); }
+          float v_now = (sum/BL_SAMPLES)*cal_vfan_gain + cal_vfan_off;
+          if(boot_baseline_count < (int)(sizeof(boot_baseline_samples)/sizeof(float))){ boot_baseline_samples[boot_baseline_count++] = v_now; }
+          boot_baseline_last_sample = now;
+        }
+        // After collecting buffer (>=5) compute median and persist
+        if(boot_baseline_count >= 5){
+          // Simple insertion sort for small array
+          for(int i=1;i<boot_baseline_count;i++){ float key=boot_baseline_samples[i]; int j=i-1; while(j>=0 && boot_baseline_samples[j]>key){ boot_baseline_samples[j+1]=boot_baseline_samples[j]; j--; } boot_baseline_samples[j+1]=key; }
+          boot_baseline_median = boot_baseline_samples[boot_baseline_count/2];
+          cal_baseline_meas = boot_baseline_median; // adopt measurement
+          // Decide compression
+          if(cal_baseline_meas >= node_v_min - COMP_MEAS_HYST){ win_comp_low = true; }
+          // Persist measurement for future boots
+          prefs.begin("fan", false); prefs.putFloat("cal_baseline_meas", cal_baseline_meas); prefs.end();
+          Serial.printf("[BOOT] Baseline captured: %.3fV (comp_low=%d)\n", cal_baseline_meas, win_comp_low?1:0);
+          boot_baseline_active=false; boot_baseline_pending=false;
+        }
+        // Safety timeout: if taking too long (>3s from start) abort to avoid blocking control
+        if(boot_baseline_active && (millis() - boot_baseline_start) > 3000){
+          Serial.println("[BOOT] Baseline capture timeout"); boot_baseline_active=false; boot_baseline_pending=false; }
+      }
     updateControl();
+    // Fast history capture (~100ms)
+    unsigned long now_ms = millis();
+    if(now_ms - fast_last_ms >= FAST_HIST_INTERVAL_MS){
+      recordFastSample();
+      fast_last_ms = now_ms;
+    }
+    // Learn state progression
+    if(learn_state==L_RUN_A || learn_state==L_RUN_B){
+      unsigned long now = millis();
+      if(now - learn_step_start >= LEARN_SETTLE_MS){
+        float v = readFanNodeAveraged(6);
+        if(learn_state==L_RUN_A) learn_vals_A[learn_step]=v; else learn_vals_B[learn_step]=v;
+        learn_step++;
+        if(learn_state==L_RUN_A && learn_step >= (int)(sizeof(LEARN_SEQ_A)/sizeof(float))){
+          learn_state = L_RUN_B; learn_step=0; raw_dutyA=0; raw_dutyB=LEARN_SEQ_B[0];
+          ledcWrite(PWM_CH_A, toDutyCounts(raw_dutyA));
+          ledcWrite(PWM_CH_B, toDutyCounts(raw_dutyB));
+          learn_step_start = now; Serial.println("[LEARN] A sequence complete -> B sequence");
+        } else if(learn_state==L_RUN_B && learn_step >= (int)(sizeof(LEARN_SEQ_B)/sizeof(float))){
+          learn_state = L_COMPUTE; Serial.println("[LEARN] Data collection done; computing...");
+        } else {
+          if(learn_state==L_RUN_A){ raw_dutyA=LEARN_SEQ_A[learn_step]; raw_dutyB=0; }
+          else { raw_dutyA=0; raw_dutyB=LEARN_SEQ_B[learn_step]; }
+          ledcWrite(PWM_CH_A, toDutyCounts(raw_dutyA));
+          ledcWrite(PWM_CH_B, toDutyCounts(raw_dutyB));
+          learn_step_start = now;
+        }
+      }
+    }
+    if(learn_state==L_COMPUTE){
+      auto regress=[&](const float *seqDuty,const float *vals,int n,float &bias,float &w){ double sumX=0,sumY=0,sumXX=0,sumXY=0; for(int i=0;i<n;i++){ double X=3.3*seqDuty[i]/100.0; double Y=vals[i]; sumX+=X; sumY+=Y; sumXX+=X*X; sumXY+=X*Y; } double denom = n*sumXX - sumX*sumX; if(fabs(denom)<1e-9){ w=0; bias=vals[0]; return; } w=(float)((n*sumXY - sumX*sumY)/denom); bias=(float)((sumY - w*sumX)/n); };
+      float bA=0,wAcalc=0,bB=0,wBcalc=0; int nA=sizeof(LEARN_SEQ_A)/sizeof(float); int nB=sizeof(LEARN_SEQ_B)/sizeof(float);
+      regress(LEARN_SEQ_A, learn_vals_A, nA, bA, wAcalc);
+      regress(LEARN_SEQ_B, learn_vals_B, nB, bB, wBcalc);
+      v_bias=(bA+bB)/2.0f; wA_eff=wAcalc; wB_eff=wBcalc;
+      bool ok=true;
+      auto fail=[&](const char* msg){ Serial.print("[LEARN][REJECT] "); Serial.println(msg); ok=false; };
+      if(!(v_bias>0.05f && v_bias<2.5f)) fail("v_bias outside plausible range (0.05-2.5V)");
+      if(!(wA_eff>0.0f)) fail("wA <= 0");
+      if(!(wB_eff>0.0f)) fail("wB <= 0");
+      if(wA_eff>0.8f) fail("wA excessively large (>0.8)");
+      if(wB_eff>0.8f) fail("wB excessively large (>0.8)");
+      if((wA_eff+wB_eff)>1.05f) fail("wA+wB sum >1.05 unphysical");
+      if(ok){
+        model_learned=true; learn_state=L_DONE; raw_override=false;
+        prefs.begin("fan", false); prefs.putFloat("v_bias", v_bias); prefs.putFloat("wA_eff", wA_eff); prefs.putFloat("wB_eff", wB_eff); prefs.putBool("model_learned", true); prefs.end();
+        Serial.printf("[LEARN] ACCEPT v_bias=%.3f wA=%.4f wB=%.4f (bA=%.3f bB=%.3f)\n", v_bias, wA_eff, wB_eff, bA, bB);
+        Serial.println("[LEARN] Completed. Future mapping now bias-aware.");
+      } else {
+        // Revert to previous (do not alter persisted values); mark done but not learned
+        model_learned=false; learn_state=L_DONE; raw_override=false; Serial.println("[LEARN] Model rejected; keeping previous parameters.");
+      }
+    }
+    // Learn command processing (trigger)
+    if(learn_state==L_IDLE && !raw_override && ac_state==AC_IDLE){
+      // Look for command token 'learn' captured earlier (we'll embed in parser shortly)
+    }
     // After updateControl we have new dutyB_now and vfan_model + vfan_meas. Clamp strategy:
     // 1. Compute predicted node voltage bounds & adjust duty target next cycle by clamping if necessary.
     // 2. Auto-raise floor if measured node persistently below node_v_min.
     static float dutyAdjust=0; // not yet used for integral corrections
     // Use measured when valid else model
     float vnode = vfan_meas > 0.05f ? vfan_meas : vfan_model;
+    // Update debug instrumentation base values
+  float wA = model_learned? wA_eff : (1.0f/10000.0f) / (1.0f/10000.0f + 1.0f/5100.0f);
+  float wB = model_learned? wB_eff : (1.0f - ((1.0f/10000.0f) / (1.0f/10000.0f + 1.0f/5100.0f)));
+    float VA_cur = 3.3f*(floor_pct/100.0f);
+    float VB_cur = 3.3f*(dutyB_now/100.0f);
+    dbg_VA = VA_cur; dbg_VB = VB_cur; dbg_vnode = vnode; dbg_VB_needed = VB_cur; // default (no change)
+  // Adaptive overlap scaling: update learn_alpha when both channels contributing meaningfully
+  if(model_learned && !raw_override && !win_invalid && !window_bypass && alpha_adapt_enabled && !learn_alpha_frozen){
+      if(VA_cur > 0.30f && VB_cur > 0.30f){ // require both > ~0.3V to avoid noise/quantization
+        float pred_raw = v_bias + wA_eff*VA_cur + wB_eff*VB_cur; // unscaled prediction
+        if(pred_raw > 0.15f){
+          float ratio = vnode / pred_raw; // expected < 1 if interaction reduces voltage
+          if(ratio < 0.10f) ratio = 0.10f; if(ratio > 1.20f) ratio = 1.20f; // guard
+          if(!learn_alpha_set){ learn_alpha = ratio; learn_alpha_set = true; }
+          else {
+            // EMA with slow convergence (10% new)
+            learn_alpha = 0.90f*learn_alpha + 0.10f*ratio;
+          }
+          // Recompute model with updated alpha for consistency this cycle
+          vfan_pred_raw = pred_raw;
+          vfan_model = v_bias + learn_alpha * (wA_eff*VA_cur + wB_eff*VB_cur);
+        }
+      }
+      // Periodic persistence if changed significantly and stable
+  if(learn_alpha_set && !learn_alpha_frozen){
+        if(fabs(learn_alpha - learn_alpha_last_saved) > 0.02f && (millis() - learn_alpha_last_persist_ms) > 8000){
+          prefs.begin("fan", false);
+          prefs.putFloat("learn_alpha", learn_alpha);
+          prefs.end();
+          learn_alpha_last_saved = learn_alpha;
+          learn_alpha_last_persist_ms = millis();
+          Serial.printf("[ALPHA] Persist learn_alpha=%.3f\n", learn_alpha);
+        }
+      }
+    }
     // Clamp high: if above node_v_max, reduce dutyB_now proportionally (modify dutyB_now directly for immediate effect)
-    if (vnode > node_v_max + 0.002f){
+  if (vnode > node_v_max + 0.010f){ // widened high-side hysteresis
       // Solve VB needed for node_v_max keeping VA fixed
-      float VA_cur = 3.3f*(floor_pct/100.0f);
-      float wA = (1.0f/10000.0f) / (1.0f/10000.0f + 1.0f/5100.0f);
-      float wB = 1.0f - wA;
-      float VB_needed = (node_v_max - wA*VA_cur)/wB;
+  float VB_needed = (node_v_max - (model_learned? v_bias:0.0f) - wA*VA_cur)/wB;
       float newDutyB = (VB_needed/3.3f)*100.0f;
       if(newDutyB < 0) newDutyB=0; if(newDutyB>100) newDutyB=100;
       dutyB_now = newDutyB; // immediate clamp
       ledcWrite(PWM_CH_B, toDutyCounts(dutyB_now));
+      dbg_VB_needed = VB_needed;
+      dbg_VB = 3.3f*(dutyB_now/100.0f); // reflect clamped value
+    }
+    // Downward floor clamp: if we're still above max and lift channel already at (or near) its minimum, gently lower floor
+  if (vnode > node_v_max + 0.015f && dutyB_now <= dutyB_min_phys + 0.20f){ // secondary threshold for floor lowering
+      // Recompute with (possibly) new dutyB_now after clamp
+      VB_cur = 3.3f*(dutyB_now/100.0f);
+  float VA_needed = (node_v_max - (model_learned? v_bias:0.0f) - wB*VB_cur)/wA; // volts
+      float floor_needed_pct = (VA_needed/3.3f)*100.0f;
+  if(floor_needed_pct < floor_pct - 0.02f){ // tighter response to excess floor
+        // Limit step size to avoid oscillation
+        float delta = floor_pct - floor_needed_pct;
+        if(delta > 0.40f) delta = 0.40f;
+        floor_pct -= delta;
+        if(floor_pct < 5.0f) floor_pct = 5.0f; // absolute safety floor
+        ledcWrite(PWM_CH_A, toDutyCounts(floor_pct));
+        floor_auto_event = true; floor_dirty = true; // mark for persistence (shared with upward logic)
+        dbg_VA = 3.3f*(floor_pct/100.0f); // update instrumentation post-change
+      }
     }
     // Auto-raise floor if node below min and duty already low-ish or temperature mode wants low output
-    if (vnode + 0.002f < node_v_min){
+  if (vnode + 0.010f < node_v_min){ // widened low-side hysteresis
       // Compute floor needed if lift were at current duty to reach node_v_min (approx invert weighting)
-      float wA = (1.0f/10000.0f) / (1.0f/10000.0f + 1.0f/5100.0f);
-      float wB = 1.0f - wA;
-      float VB_cur = 3.3f*(dutyB_now/100.0f);
-      float VA_needed = (node_v_min - wB*VB_cur)/wA;
+      VB_cur = 3.3f*(dutyB_now/100.0f);
+  float VA_needed = (node_v_min - (model_learned? v_bias:0.0f) - wB*VB_cur)/wA;
       float floor_needed = (VA_needed/3.3f)*100.0f;
       if(floor_needed > floor_pct){
         floor_pct = sane(floor_needed, 5.0f, 80.0f, floor_pct);
         ledcWrite(PWM_CH_A, toDutyCounts(floor_pct));
         floor_auto_event = true;
         floor_dirty = true; // schedule persistence
+        dbg_VA = 3.3f*(floor_pct/100.0f);
       }
     }
     // Debounced persistence of auto-raised floor (every 5s max)
@@ -1150,10 +1827,5 @@ void loop(){
     }
     lastUpdate = millis();
   }
-  // Heartbeat every second so late-attached monitors show activity
-  static unsigned long lastBeat=0; 
-  if(millis()-lastBeat > 1000){
-    Serial.println("HB");
-    lastBeat = millis();
-  }
+  // (Heartbeat removed to reduce serial noise)
 }

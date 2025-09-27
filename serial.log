@@ -1,0 +1,56 @@
+19:34:34.660 -> === PS4 Fan Ctrl Boot ===
+19:34:34.660 -> Build: Sep 27 2025 19:31:41
+19:34:34.660 -> CPU freq: 160 MHz  Free heap: 265976
+19:34:34.660 -> USB CDC compile flag active
+19:34:34.660 -> Chip rev: 4  SDK: v4.4.7-dirty
+19:34:34.660 -> Init peripherals...
+19:34:34.660 -> LEDC timers: A=31250.0 Hz, B=31250.0 Hz (res=10 bits)
+19:34:34.745 -> [   586][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: vin_min_v NOT_FOUND
+19:34:34.745 -> [   594][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: vin_max_v NOT_FOUND
+19:34:34.778 -> [   602][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: floor_pct NOT_FOUND
+19:34:34.778 -> [   611][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: lift_span NOT_FOUND
+19:34:34.778 -> [   619][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: fan_max NOT_FOUND
+19:34:34.778 -> [   627][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: attack_ms NOT_FOUND
+19:34:34.812 -> [   636][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: temp_fail NOT_FOUND
+19:34:34.812 -> [   644][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: cal_vin_off NOT_FOUND
+19:34:34.812 -> [   653][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: cal_vin_gain NOT_FOUND
+19:34:34.812 -> [   661][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: cal_vfan_off NOT_FOUND
+19:34:34.845 -> [   670][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: cal_vfan_gain NOT_FOUND
+19:34:34.845 -> [   679][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: t0 NOT_FOUND
+19:34:34.845 -> [   687][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: f0 NOT_FOUND
+19:34:34.845 -> [   694][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: t1 NOT_FOUND
+19:34:34.878 -> [   702][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: f1 NOT_FOUND
+19:34:34.878 -> [   710][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: t2 NOT_FOUND
+19:34:34.878 -> [   718][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: f2 NOT_FOUND
+19:34:34.878 -> [   725][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: t3 NOT_FOUND
+19:34:34.916 -> [   733][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: f3 NOT_FOUND
+19:34:34.916 -> [   741][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: t4 NOT_FOUND
+19:34:34.916 -> [   749][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: f4 NOT_FOUND
+19:34:34.916 -> [   757][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: cal_dutyB_max NOT_FOUND
+19:34:34.916 -> [   765][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: v_bias NOT_FOUND
+19:34:34.950 -> [   773][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: wA_eff NOT_FOUND
+19:34:34.950 -> [   782][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: wB_eff NOT_FOUND
+19:34:34.950 -> [   790][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: cal_baseline_meas NOT_FOUND
+19:34:34.950 -> [   799][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: learn_alpha NOT_FOUND
+19:34:34.987 -> [BOOT] floor_pct missing -> using default 77.00
+19:34:34.987 -> [   808][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: node_v_min NOT_FOUND
+19:34:34.987 -> [   816][E][Preferences.cpp:503] getBytesLength(): nvs_get_blob len fail: node_v_max NOT_FOUND
+19:34:34.987 -> [BOOT] node_v_min missing -> using defaults min=1.044 max=1.180
+19:34:34.987 -> [BOOT] Persisted updated defaults (first-run or post-factory)
+19:34:34.987 -> [BOOT] Effective defaults: floor_pct=77.00 node_v_min=1.044 node_v_max=1.180
+19:34:36.513 -> [BOOT] Baseline capture start
+19:34:39.399 -> [  5236][E][Preferences.cpp:294] putBytes(): nvs_set_blob fail: cal_baseline_meas KEY_TOO_LONG
+19:34:39.399 -> [BOOT] Baseline captured: 1.064V (comp_low=1)
+19:34:59.757 -> [SAVE] OK (config+cal+model persisted)
+19:35:04.803 -> === DUMP (human) ===
+19:35:04.803 -> Mode: TEMP  Fail:no  Sensors:2
+19:35:04.835 -> Temps: hot=35.25 other=32.06  temp_fail=80.0
+19:35:04.835 -> Vin: now=0.000 (min=0.600 max=1.000) cal_off=0.000 cal_gain=1.000
+19:35:04.835 -> FanNode: model=1.065 meas=1.239 (win=1.044..1.180) cal_off=0.000 cal_gain=1.000
+19:35:04.835 -> Dbg: VA=2.541 VB=0.486 VB_need=0.486 vnode=1.239
+19:35:04.835 -> Floor=77.00%  LiftSpan=20.00%  FanMax=100.00%  Attack=200ms
+19:35:04.835 -> DutyB: now=14.72% window=8.50%..14.72% (flags: L=1 H=0 !=0 autoF=0)
+19:35:04.835 -> WinFlags: impossible=0 calWarnFloorHigh=0 calWarnSpanSmall=0
+19:35:04.835 -> AutoCal: state=0 valid=0 dutyB_max=-1.00 lastV=0.000 floor_mid=32.00 lift_mid=50.00 baseV=0.000 itF=0 itL=0
+19:35:04.835 -> Curve T->F: 30.0->10.0, 35.0->15.0, 40.0->20.0, 45.0->30.0, 55.0->100.0
+19:35:04.835 -> === END ===
