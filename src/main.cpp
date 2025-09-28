@@ -5,6 +5,8 @@
 #include <DallasTemperature.h>
 #include <driver/adc.h>   // for analogSetPinAttenuation
 #include <esp_sleep.h>
+#include <driver/gpio.h>   // for gpio hold (ensure pins held low in deep sleep)
+#include <stdarg.h>
 
 // -------- PINS / PWM ----------
 #define PWM_FREQ_HZ      31250  // default PWM frequency (Hz)
@@ -17,14 +19,128 @@
 #define PIN_DS18B20      5         // 1-Wire bus (all DS18B20 sensors)
 #define PIN_FAN_FB       3         // ADC: fan node feedback via 100k + 10nF to GND (MCU side)
 
-// Wi-Fi AP
-const char* ssid = "PS4FAN-CTRL";
-const char* password = "12345678";
+// Wi-Fi credentials / modes
+// Behavior: Attempt station (STA) connection if wifi_ssid is non-empty; fallback to AP if
+// connection fails (timeout) or SSID empty. AP always uses fallback SSID/password below.
+static String wifi_ssid="4GVAARAMENTIE";          // user-configured target SSID (persisted)
+static String wifi_pass="vaaramentie1a2";          // user-configured password (persisted)
+static uint32_t wifi_conn_ms = 8000;  // connection attempt timeout (ms) persisted
+// Fallback AP credentials (constant)
+static const char* AP_SSID = "PS4FAN-CTRL";
+static const char* AP_PASS = "12345678"; // keep simple; user can still reconfigure station creds
+static bool wifi_sta_connected=false; // runtime state
+static bool wifi_started_ap=false;    // track if AP fallback engaged
+static unsigned long wifi_connect_start=0;
+static String wifi_ip_str="";        // cached IP string when connected
 // --- Restored global objects (lost during previous patch corruption) ---
 Preferences prefs;                 // NVS key/value storage
 OneWire oneWire(PIN_DS18B20);      // 1-Wire bus on defined pin
 DallasTemperature sensors(&oneWire); // DS18B20 temperature sensors
 WebServer server(80);              // HTTP server
+
+// (moved wifiStatusStr & attemptWifi below after log macros)
+
+// --- Event Log (state-change history) ---------------------------------------
+// 8KB budget -> 128 entries * 64 bytes.
+// Log only discrete state changes (no periodic telemetry) to avoid noise.
+
+static const uint16_t LOG_CAPACITY = 128;        // number of entries in ring
+static const uint8_t  LOG_MSG_CHARS = 48;        // max message length (excludes null)
+
+enum LogSeverity : uint8_t { LOG_INFO=0, LOG_WARN=1, LOG_ERR=2, LOG_DBG=3 }; // DBG optional
+enum LogCategory : uint8_t { LOGC_SLP=0, LOGC_SET=1, LOGC_CAL=2, LOGC_PWR=3, LOGC_NET=4, LOGC_ERR=5 };
+
+struct LogEntry {
+  uint32_t id;      // monotonically increasing ID (wrap ok)
+  uint32_t t_ms;    // millis() at insertion
+  uint8_t  cat;     // category
+  uint8_t  sev;     // severity
+  char     msg[LOG_MSG_CHARS]; // truncated / null-terminated
+};
+
+static LogEntry log_buf[LOG_CAPACITY];
+static uint16_t log_count = 0;   // current number of valid entries
+static uint16_t log_head = 0;    // next insertion index
+static uint32_t log_next_id = 1; // start IDs at 1
+static uint32_t log_dropped = 0; // future: rate limiting drops
+
+static void log_add(uint8_t cat, uint8_t sev, const char *fmt, ...) {
+  LogEntry &e = log_buf[log_head];
+  e.id = log_next_id++;
+  e.t_ms = millis();
+  e.cat = cat;
+  e.sev = sev;
+  va_list ap; va_start(ap, fmt);
+  vsnprintf(e.msg, LOG_MSG_CHARS, fmt, ap);
+  va_end(ap);
+  e.msg[LOG_MSG_CHARS-1] = '\0';
+  log_head = (log_head + 1) % LOG_CAPACITY;
+  if (log_count < LOG_CAPACITY) log_count++; // else overwrite oldest implicitly
+}
+static void log_clear(){ log_count=0; log_head=0; log_next_id=1; log_dropped=0; }
+
+#ifdef ENABLE_LOG_DEBUG
+  #define LOG_DEBUG(cat, fmt, ...) log_add(cat, LOG_DBG, fmt, ##__VA_ARGS__)
+#else
+  #define LOG_DEBUG(cat, fmt, ...)
+#endif
+#define LOG_INFO(cat, fmt, ...)  log_add(cat, LOG_INFO, fmt, ##__VA_ARGS__)
+#define LOG_WARN(cat, fmt, ...)  log_add(cat, LOG_WARN, fmt, ##__VA_ARGS__)
+#define LOG_ERROR(cat, fmt, ...) log_add(cat, LOG_ERR,  fmt, ##__VA_ARGS__)
+
+// Helper: map wl_status codes to short strings (now after macros so we can log)
+static const char* wifiStatusStr(wl_status_t s){
+  switch(s){
+    case WL_IDLE_STATUS: return "IDLE";
+    case WL_NO_SSID_AVAIL: return "NO_SSID";
+    case WL_SCAN_COMPLETED: return "SCAN_OK";
+    case WL_CONNECTED: return "CONNECTED";
+    case WL_CONNECT_FAILED: return "FAIL";
+    case WL_CONNECTION_LOST: return "LOST";
+    case WL_DISCONNECTED: return "DISC";
+    default: return "UNKNOWN";
+  }
+}
+
+// Attempt WiFi STA connection (if credentials present) else start / fallback to AP.
+// forceSTA: always attempt STA even if previously connected or AP started.
+static void attemptWifi(bool forceSTA=false){
+  // Always reset flags for a clean attempt
+  wifi_sta_connected=false; wifi_started_ap=false; wifi_ip_str="";
+  if(wifi_ssid.length()==0){
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    wifi_started_ap=true;
+    wifi_ip_str = WiFi.softAPIP().toString();
+    LOG_INFO(LOGC_NET, "ap mode ip=%s (no creds)", wifi_ip_str.c_str());
+    return;
+  }
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true); // clear prior state
+  delay(40);
+  WiFi.begin(wifi_ssid.c_str(), wifi_pass.length()?wifi_pass.c_str():nullptr);
+  wifi_connect_start = millis();
+  LOG_INFO(LOGC_NET, "sta attempt ssid=%s", wifi_ssid.c_str());
+  unsigned long lastStatusPrint=0; wl_status_t st;
+  while((st=WiFi.status())!=WL_CONNECTED && (millis()-wifi_connect_start) < wifi_conn_ms){
+    delay(120);
+    if(Serial && millis()-lastStatusPrint > 850){
+      Serial.printf("[WIFI] waiting status=%s elapsed=%lums\n", wifiStatusStr(st), (unsigned long)(millis()-wifi_connect_start));
+      lastStatusPrint=millis();
+    }
+  }
+  st = WiFi.status();
+  if(st==WL_CONNECTED){
+    wifi_sta_connected=true; wifi_ip_str = WiFi.localIP().toString();
+    LOG_INFO(LOGC_NET, "sta ok ip=%s", wifi_ip_str.c_str());
+  } else {
+    LOG_WARN(LOGC_NET, "sta fail status=%s timeout=%lu", wifiStatusStr(st), (unsigned long)wifi_conn_ms);
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    wifi_started_ap=true; wifi_ip_str = WiFi.softAPIP().toString();
+    LOG_INFO(LOGC_NET, "ap mode ip=%s", wifi_ip_str.c_str());
+  }
+}
 
 // Defaults struct (restored after accidental corruption in previous patch)
 struct Defaults {
@@ -48,6 +164,9 @@ struct Defaults {
   float slp_tC_max  = 45.0f;    // Only sleep if hottest temp BELOW this (safety)
   uint32_t slp_t_ms = 10000;    // dwell time (ms) that conditions must persist before deep sleep
   uint32_t slp_w_ms = 2000;     // wake probe interval (ms) (converted to deep sleep timer)
+  float    slp_wake_tC_min = 35.0f; // minimum temp required to allow wake (console producing heat)
+  float    slp_v_hyst = 0.100f; // default VIN hysteresis band (raise from 0.010 to 0.100)
+  uint32_t slp_min_awake_ms = 45000; // default minimum awake interval (ms)
 } D;
 
 // -------- PARAMETERS (persisted) ----------
@@ -78,12 +197,24 @@ float    slp_v       = D.slp_v;       // vin threshold (volts)
 float    slp_tC_max  = D.slp_tC_max;  // hottest temp must be BELOW this
 uint32_t slp_t_ms    = D.slp_t_ms;    // required continuous dwell below vin & temp for sleep
 uint32_t slp_w_ms    = D.slp_w_ms;    // wake probe interval
+float    slp_wake_tC_min = D.slp_wake_tC_min; // wake temperature guard (disabled if <=0)
 // Runtime tracking
 unsigned long slp_cond_start_ms = 0;  // when both conditions first satisfied (0=inactive)
 bool          slp_armed=false;        // armed status (conditions currently satisfied)
 const unsigned long SLP_BOOT_GRACE_MS = 4000; // grace after boot before evaluating sleep
 // For status / JSON
 bool slp_pending=false;              // we are currently counting down dwell
+
+// --- Extended Sleep Controls (new) ---
+float    slp_v_hyst = D.slp_v_hyst; // hysteresis band (abort if vin >= slp_v + slp_v_hyst once arming)
+uint8_t  slp_arm_samples = 3;       // consecutive qualifying loop iterations before dwell timer starts
+uint32_t slp_min_awake_ms = D.slp_min_awake_ms;  // minimum ms after wake/boot before re-arming allowed (loaded/migrated in setup)
+uint8_t  slp_mode = 0;              // 0=VIN_AND_TEMP 1=VIN_ONLY 2=TEMP_ONLY 3=VIN_OR_TEMP
+bool     slp_probe_active = false;  // true immediately after RTC timer wake until wake thresholds satisfied
+bool     slp_probe_logged  = false; // ensure single log line for suppression
+uint8_t  slp_sample_count = 0;      // current consecutive qualify count
+unsigned long slp_last_wake_ms = 0; // set in setup() after initialization
+String sleep_state = "awake";      // exported JSON state (awake|arming)
 
 
 // -------- LIVE VARS ----------
@@ -349,7 +480,8 @@ void updateControl(){
       vin_raw = vin_avg; const float ALPHA_VIN = 0.20f; vin_now = (vin_now==0?vin_avg:(vin_now + ALPHA_VIN*(vin_avg - vin_now)));
       if(!vin_obs_start) vin_obs_start=millis(); if(millis()-vin_obs_start>1000){ if(vin_avg<vin_min_obs) vin_min_obs=vin_avg; if(vin_avg>vin_max_obs) vin_max_obs=vin_avg; }
       vin_last_avg = vin_avg; static unsigned long _lastVinDbg=0; unsigned long _nowDbg=millis();
-  if(_nowDbg - _lastVinDbg > 6000){ int mv_probe = analogReadMilliVolts(PIN_PS4_IN); DBG_PRINT( if(Serial) Serial.printf("[VIN-DBG] LEG probe=%dmV avgRaw=%.3f base=%.3f avg=%.3f now=%.3f band=(%.3f..%.3f) min=%.3f max=%.3f\n", mv_probe, vin_avg_raw, vin_baseline, vin_avg, vin_now, band_low, band_high, vin_min_obs, vin_max_obs) ); _lastVinDbg=_nowDbg; }
+  // Removed periodic LEG VIN-DBG telemetry (was verbose). Keep timing placeholder if future hook needed.
+  // if(_nowDbg - _lastVinDbg > 6000){ _lastVinDbg=_nowDbg; }
     } else {
       // Robust filter: median + adaptive trimmed mean + guarded baseline & asymmetric clamp
       const int N=21; int mv[N]; vin_total_raw=N; vin_rail_lo_ct=0; vin_rail_hi_ct=0;
@@ -402,7 +534,8 @@ void updateControl(){
       if(!vin_obs_start) vin_obs_start=millis(); if(millis()-vin_obs_start>1000){ if(vin_avg<vin_min_obs) vin_min_obs=vin_avg; if(vin_avg>vin_max_obs) vin_max_obs=vin_avg; }
       vin_last_avg = vin_avg;
       static unsigned long _lastVinDbg=0; unsigned long _nowDbg=millis();
-  if(_nowDbg - _lastVinDbg > 6000){ int mv_probe = analogReadMilliVolts(PIN_PS4_IN); DBG_PRINT( if(Serial) Serial.printf("[VIN-DBG] ROB probe=%dmV med=%.3f trim=%.3f base=%.3f now=%.3f surv=%u/%u rails(L/H)=%u/%u band=(%.3f..%.3f) upd=%d noisy=%d std=%.0fmV unstable=%d\n", mv_probe, vin_median_last, vin_trimmed_mean_last, vin_baseline, vin_now, vin_survivors, vin_total_raw, vin_rail_lo_ct, vin_rail_hi_ct, band_low, band_high, vin_baseline_upd?1:0, (stddev_mv>260)?1:0, stddev_mv, vin_unstable?1:0) ); _lastVinDbg=_nowDbg; }
+  // Removed periodic ROB VIN-DBG telemetry (was verbose). Placeholder left intentionally.
+  // if(_nowDbg - _lastVinDbg > 6000){ _lastVinDbg=_nowDbg; }
     }
   }
 
@@ -599,8 +732,33 @@ void updateControl(){
   vnode_residual = vfan_meas - vfan_model; vnode_bias_ema = (vnode_bias_ema==0? vnode_residual : (vnode_bias_ema + VNODE_BIAS_ALPHA*(vnode_residual - vnode_bias_ema)));
   }
 
+  // Sleep probe suppression: if we just woke from timer and conditions to remain awake are NOT met, hold fan off
+  bool skip_rest_control=false;
+  if(slp_probe_active && !raw_override && ac_state==AC_IDLE){
+    bool vin_wake_ok = (vin_now >= slp_v);
+    bool temp_wake_ok = true;
+    if(slp_wake_tC_min > 0 && tempValid(temp_hot)) temp_wake_ok = (temp_hot >= slp_wake_tC_min);
+    bool stay_awake = false;
+    switch(slp_mode){
+      case 0: stay_awake = vin_wake_ok && temp_wake_ok; break; // VIN AND TEMP
+      case 1: stay_awake = vin_wake_ok; break;                 // VIN ONLY
+      case 2: stay_awake = temp_wake_ok; break;                // TEMP ONLY
+      case 3: stay_awake = (vin_wake_ok || temp_wake_ok); break; // VIN OR TEMP
+    }
+    if(stay_awake){
+      slp_probe_active = false; // normal control resumes
+    } else {
+      // Suppress fan outputs to 0 (both channels) during probe; keep dutyB_now 0 for UI
+      ledcWrite(PWM_CH_A, toDutyCounts(0));
+      ledcWrite(PWM_CH_B, toDutyCounts(0));
+      dutyB_now = 0; fan_now_pct = 0; // logical representation
+      if(!slp_probe_logged){ LOG_INFO(LOGC_SLP, "probe suppress vin=%.3f temp=%.1f thr=%.3f wake_t=%.1f", vin_now, temp_hot, slp_v, slp_wake_tC_min); slp_probe_logged=true; }
+      // Mark to skip remainder of control math (but still run sleep evaluator at end)
+      skip_rest_control=true;
+    }
+  }
   // -------- Auto-Calibration State Machine (overrides outputs while active) --------
-  if(ac_state != AC_IDLE && ac_state != AC_DONE && ac_state != AC_ERROR){
+  if(!skip_rest_control && ac_state != AC_IDLE && ac_state != AC_DONE && ac_state != AC_ERROR){
     alpha_adapt_enabled = false; // freeze adaptation during active calibration
     unsigned long now = millis();
     // Adaptive settle: longer early, shorter as bracket narrows
@@ -744,8 +902,7 @@ void updateControl(){
       ledcWrite(PWM_CH_B, toDutyCounts(ac_lift_mid));
       dutyB_now = ac_lift_mid; return; }
     // If done or error we fall through to normal mapping using results (if any)
-  }
-  else {
+  } else if(!skip_rest_control) {
     // Calibration inactive: if it just finished, evaluate results and unfreeze adaptation
     if(!alpha_adapt_enabled){ alpha_adapt_enabled=true; }
     // Floor guard after phase1: if calibration completed but floor too low vs target
@@ -766,7 +923,7 @@ void updateControl(){
   }
 
   // Alpha adaptation gating: disable if suspect compression or near saturation
-  if(alpha_adapt_enabled){
+  if(!skip_rest_control && alpha_adapt_enabled){
     bool nearFull = (cal_valid && cal_dutyB_max > FULL_LIFT_WARN_THRESH && dutyB_now > (cal_dutyB_max - 1.0f));
     bool suspectCompression = (win_comp_low && cal_baseline_meas>0 && cal_baseline_meas < node_v_min - BASELINE_RECHECK_MARGIN);
     if(nearFull || suspectCompression){ alpha_adapt_enabled=false; }
@@ -774,12 +931,13 @@ void updateControl(){
 
   // Log every second
   static unsigned long lastLog=0;
-  if (millis()-lastLog >= 1000){
+  if (!skip_rest_control && millis()-lastLog >= 1000){
     history[hist_head] = { millis()/1000, temp_hot, temp_other, vin_now, vfan_model, vfan_meas, dutyB_now };
     hist_head = (hist_head+1) % HISTORY_LEN;
     if (hist_count < HISTORY_LEN) hist_count++;
     lastLog = millis();
   }
+
 }
 
 // -------- WEB UI ----------
@@ -828,7 +986,7 @@ String htmlPage(){
   h+="<h3>Live Status</h3>";
   h+="<table style='width:100%;font-size:13px;border-collapse:collapse'>";
   h+="<tr><th style='text-align:left'>Signal</th><th>Value</th><th style='text-align:left'>Notes</th></tr>";
-  h+="<tr><td>Vin (PS4 in)</td><td><span id='vin'>?</span> V</td><td>Mapped between Vin Min/Max</td></tr>";
+  h+="<tr><td>Vin (PS4 in)</td><td><span id='vin'>?</span> V</td><td>Mapped between Vin Min/Max <span id='jsonErr' style='color:#c00;font-size:11px;margin-left:8px'></span></td></tr>";
   h+="<tr><td>Fan Node (model)</td><td><span id='vfan'>?</span> V</td><td>Resistor network prediction</td></tr>";
   h+="<tr><td>Fan Node (meas)</td><td><span id='vfanm'>?</span> V</td><td>ADC feedback</td></tr>";
   h+="<tr><td>Lift PWM</td><td><span id='dutyB'>?</span> %</td><td>After slew limiting</td></tr>";
@@ -976,6 +1134,32 @@ String htmlPage(){
   h+="<button class='btn help-btn' onclick='openHelp()'>Help</button>";
   h+="</div>";
 
+  // Sleep settings section (new)
+  h+="<div class='panel'><h3>Sleep Settings</h3>";
+  h+="<table class='cfg'><tr><td>Enable</td><td><input type='checkbox' id='slp_en'></td><td><button class='btn small' onclick=\"resetParam('slp_en')\">Reset</button></td></tr>";
+  h+="<tr><td>Vin Threshold (V)</td><td><input type='number' step='0.001' id='slp_v' style='width:90px'></td><td><button class='btn small' onclick=\"resetParam('slp_v')\">Reset</button></td></tr>";
+  h+="<tr><td>Temp Max (°C)</td><td><input type='number' step='0.1' id='slp_tC_max' style='width:90px'></td><td><button class='btn small' onclick=\"resetParam('slp_tC_max')\">Reset</button></td></tr>";
+  h+="<tr><td>Wake Temp Min (°C)</td><td><input type='number' step='0.1' id='slp_wake_tC_min' style='width:90px' placeholder='(opt)'></td><td><button class='btn small' onclick=\"resetParam('slp_wake_tC_min')\">Reset</button></td></tr>";
+  h+="<tr><td>Dwell ms</td><td><input type='number' step='100' id='slp_t_ms' style='width:110px'></td><td><button class='btn small' onclick=\"resetParam('slp_t_ms')\">Reset</button></td></tr>";
+  h+="<tr><td>Wake Interval ms</td><td><input type='number' step='100' id='slp_w_ms' style='width:110px'></td><td><button class='btn small' onclick=\"resetParam('slp_w_ms')\">Reset</button></td></tr>";
+  h+="<tr><td>Vin Hysteresis (V)</td><td><input type='number' step='0.001' id='slp_v_hyst' style='width:90px'></td><td><button class='btn small' onclick=\"resetParam('slp_v_hyst')\">Reset</button></td></tr>";
+  h+="<tr><td>Arm Samples</td><td><input type='number' step='1' id='slp_arm_samples' style='width:70px'></td><td><button class='btn small' onclick=\"resetParam('slp_arm_samples')\">Reset</button></td></tr>";
+  h+="<tr><td>Min Awake ms</td><td><input type='number' step='100' id='slp_min_awake_ms' style='width:110px'></td><td><button class='btn small' onclick=\"resetParam('slp_min_awake_ms')\">Reset</button></td></tr>";
+  h+="<tr><td>Mode</td><td><select id='slp_mode' style='width:140px'><option value='0'>VIN AND TEMP</option><option value='1'>VIN ONLY</option><option value='2'>TEMP ONLY</option><option value='3'>VIN OR TEMP</option></select></td><td><button class='btn small' onclick=\"resetParam('slp_mode')\">Reset</button></td></tr>";
+  h+="<tr><td colspan='3' style='font-size:11px;opacity:0.75'>Sleep triggers after Dwell ms once Mode conditions hold. Min Awake guards against rapid cycling. Hysteresis requires VIN to rise above (Vin Thr + Hyst) to abort after arming. Optional Wake Temp Min delays wake until console produces some heat (disable by leaving blank or &lt;=0).</td></tr>";
+  h+="</table></div>";
+  // Log panel UI
+  h+="<div class='panel'><h3>Event Log</h3><div style='margin-bottom:6px'>";
+  h+="Min Sev:<select id='logSev'><option value='0'>INFO</option><option value='1'>WARN</option><option value='2'>ERROR</option><option value='3'>DEBUG</option></select> ";
+  h+="Cats:<label><input type='checkbox' class='logCat' value='0' checked>SLP</label>";
+  h+="<label><input type='checkbox' class='logCat' value='1' checked>SET</label>";
+  h+="<label><input type='checkbox' class='logCat' value='2' checked>CAL</label>";
+  h+="<label><input type='checkbox' class='logCat' value='3' checked>PWR</label>";
+  h+="<label><input type='checkbox' class='logCat' value='4' checked>NET</label>";
+  h+="<label><input type='checkbox' class='logCat' value='5' checked>ERR</label>";
+  h+=" <button class='btn small' id='logClearBtn'>Clear</button>";
+  h+=" <button class='btn small' id='logPauseBtn'>Pause</button>";
+  h+="</div><pre id='logView' style='height:180px;overflow:auto;background:#111;color:#0f0;padding:6px;font-size:11px;line-height:1.25em;border:1px solid #333'></pre></div>";
   h+="<div id='charts'><canvas id='cTemp'></canvas><canvas id='cFan'></canvas><canvas id='cVfan'></canvas></div>";
   h+="<p><a href='/history' target='_blank'>Open history JSON</a></p>";
   h+="</div>"; // close container
@@ -1014,14 +1198,14 @@ String htmlPage(){
   h+="function $(id){return document.getElementById(id);}";
   h+="function updateDisplay(id,val,dec){var d=$(id+'_val');if(d){if(dec===undefined)dec=3;d.textContent=parseFloat(val).toFixed(dec);}}";
   h+="var defaults={};var configLoaded=false;";
-  h+="function xhrJSON(url,cb){try{var x=new XMLHttpRequest();x.onreadystatechange=function(){if(x.readyState==4){if(x.status==200){try{cb(null,JSON.parse(x.responseText));}catch(e){cb(e);} } else cb(new Error('status '+x.status));}};x.open('GET',url,true);x.send();}catch(e){cb(e);}}";
+  h+="function xhrJSON(url,cb){try{var x=new XMLHttpRequest();x.onreadystatechange=function(){if(x.readyState==4){if(x.status==200){var txt=x.responseText;try{cb(null,JSON.parse(txt));}catch(e){if(window.console)console.error('JSON parse error '+url+' len='+txt.length,e);cb(e);} } else {if(window.console)console.error('HTTP '+x.status+' '+url);cb(new Error('status '+x.status));}}};x.open('GET',url,true);x.send();}catch(e){if(window.console)console.error('xhr ex',e);cb(e);}}";
   h+="function xhrText(url,cb){try{var x=new XMLHttpRequest();x.onreadystatechange=function(){if(x.readyState==4){if(x.status==200){cb(null,x.responseText);}else{cb(new Error('status '+x.status),null);}}};x.open('GET',url,true);x.send();}catch(e){cb(e,null);}}";
   h+="// Load defaults early\n";
   h+="xhrJSON('/defaults',function(err,d){if(!err && d && d.defaults){defaults=d.defaults;}});";
   // Correct loadConfigToUI (previous stray JS removed)
-  h+="function loadConfigToUI(cfg){try{if(window.console)console.log('Config received',cfg);}catch(e){}var info={vin_min_v:3,vin_max_v:3,lift_span:1,floor_pct:1,fan_max:1,attack_ms:0,temp_fail:0,cal_vin_off:3,cal_vin_gain:3,cal_vfan_off:3,cal_vfan_gain:3};var curveKeys={};for(var i=0;i<5;i++){curveKeys['t'+i]=true;curveKeys['f'+i]=true;}var allZero=true;for(var i=0;i<5;i++){if(cfg.hasOwnProperty('t'+i)&&parseFloat(cfg['t'+i])!==0){allZero=false;break;}}if(allZero){if(window.console)console.warn('Curve all zero - using defaults');for(var i=0;i<5;i++){if(defaults.hasOwnProperty('t'+i)){cfg['t'+i]=defaults['t'+i];cfg['f'+i]=defaults['f'+i];}}}for(var k in cfg){if(!cfg.hasOwnProperty(k)||curveKeys[k])continue;var el=$(k);if(el){var dec=info.hasOwnProperty(k)?info[k]:(k.indexOf('gain')>-1||k.indexOf('off')>-1?3:1);el.value=cfg[k];updateDisplay(k,cfg[k],dec);}}for(var i=0;i<5;i++){var tk='t'+i,fk='f'+i;var tEl=$(tk),fEl=$(fk);if(tEl&&cfg.hasOwnProperty(tk))tEl.value=cfg[tk];if(fEl&&cfg.hasOwnProperty(fk))fEl.value=cfg[fk];}setupVinConstraints();}";
+  h+="function loadConfigToUI(cfg){try{if(window.console)console.log('Config received',cfg);}catch(e){}var info={vin_min_v:3,vin_max_v:3,lift_span:1,floor_pct:1,fan_max:1,attack_ms:0,temp_fail:0,cal_vin_off:3,cal_vin_gain:3,cal_vfan_off:3,cal_vfan_gain:3,slp_v:3,slp_v_hyst:3};var curveKeys={};for(var i=0;i<5;i++){curveKeys['t'+i]=true;curveKeys['f'+i]=true;}var allZero=true;for(var i=0;i<5;i++){if(cfg.hasOwnProperty('t'+i)&&parseFloat(cfg['t'+i])!==0){allZero=false;break;}}if(allZero){if(window.console)console.warn('Curve all zero - using defaults');for(var i=0;i<5;i++){if(defaults.hasOwnProperty('t'+i)){cfg['t'+i]=defaults['t'+i];cfg['f'+i]=defaults['f'+i];}}}for(var k in cfg){if(!cfg.hasOwnProperty(k)||curveKeys[k])continue;var el=$(k);if(el){if(k==='slp_en'){el.checked = (cfg[k]==1||cfg[k]==='1'||cfg[k]===true);continue;}if(k==='slp_mode'){el.value=cfg[k];continue;}var dec=info.hasOwnProperty(k)?info[k]:(k.indexOf('gain')>-1||k.indexOf('off')>-1?3: (k.indexOf('_ms')>-1?0:1));el.value=cfg[k];updateDisplay(k,cfg[k],dec);}}for(var i=0;i<5;i++){var tk='t'+i,fk='f'+i;var tEl=$(tk),fEl=$(fk);if(tEl&&cfg.hasOwnProperty(tk))tEl.value=cfg[tk];if(fEl&&cfg.hasOwnProperty(fk))fEl.value=cfg[fk];}setupVinConstraints();}";
   h+="var __cfgTries=0;";
-  h+="function refresh(){xhrJSON('/json',function(err,data){if(err||!data)return;var vinEl=$('vin');if(!vinEl)return; $('vin').textContent=data.vin.toFixed(3);$('vfan').textContent=data.vfan.toFixed(3);$('vfanm').textContent=data.vfanm.toFixed(3);$('dutyB').textContent=data.dutyB.toFixed(1);if(data.dutyB_min!=null&&data.dutyB_max!=null){$('dutyRange').textContent=data.dutyB_min.toFixed(1)+'–'+data.dutyB_max.toFixed(1);}var flags='';if(data.win_comp_low)flags+='L';if(data.win_comp_high)flags+='H';if(data.win_invalid)flags+='!';if(data.floor_auto)flags+=(flags?' ':'')+'F';$('winFlags').textContent=flags||'—';var acMap={0:'idle',1:'floor set',2:'floor wait',3:'floor eval',4:'lift set',5:'lift wait',6:'lift eval',7:'done', '-1':'error'};var ac=acMap[data.ac_state]||data.ac_state; if(data.ac_valid) ac+=' ✓';$('acStatus').textContent=ac+(data.ac_duty_max>=0?(' max='+data.ac_duty_max.toFixed(1)+'%'):'');$('temp0').textContent=(data.temp0!=null)?data.temp0.toFixed(1):'—';$('temp1').textContent=(data.temp1!=null)?data.temp1.toFixed(1):'—';$('dscount').textContent=data.dscount;$('mode').textContent=data.mode?'Temp':'PS4';$('fail').textContent=data.fail?'YES':'no';if(data.config && !configLoaded){var defaultsReady=false;for(var k in defaults){if(defaults.hasOwnProperty(k)){defaultsReady=true;break;}}var allZero=true;for(var i=0;i<5;i++){var tk='t'+i; if(!data.config.hasOwnProperty(tk)){allZero=false;break;} if(parseFloat(data.config[tk])!==0){allZero=false;break;}}if((!data.curve_ok && allZero) || !defaultsReady){ if(__cfgTries<6){ if(window.console)console.warn('Deferring config apply (try '+__cfgTries+') curve_ok='+data.curve_ok+' allZero='+allZero+' defaultsReady='+defaultsReady); __cfgTries++; setTimeout(refresh,250); return; } else { if(window.console)console.warn('Applying config after max retries; using whatever values present'); } } loadConfigToUI(data.config); configLoaded=true;}});}";
+  h+="function refresh(){xhrJSON('/json',function(err,data){var er=$('jsonErr');if(er){er.textContent=err?'JSON err':'';}if(err||!data)return;var vinEl=$('vin');if(!vinEl)return; $('vin').textContent=data.vin.toFixed(3);$('vfan').textContent=data.vfan.toFixed(3);$('vfanm').textContent=data.vfanm.toFixed(3);$('dutyB').textContent=data.dutyB.toFixed(1);if(data.dutyB_min!=null&&data.dutyB_max!=null){$('dutyRange').textContent=data.dutyB_min.toFixed(1)+'–'+data.dutyB_max.toFixed(1);}var flags='';if(data.win_comp_low)flags+='L';if(data.win_comp_high)flags+='H';if(data.win_invalid)flags+='!';if(data.floor_auto)flags+=(flags?' ':'')+'F';$('winFlags').textContent=flags||'—';var acMap={0:'idle',1:'floor set',2:'floor wait',3:'floor eval',4:'lift set',5:'lift wait',6:'lift eval',7:'done', '-1':'error'};var ac=acMap[data.ac_state]||data.ac_state; if(data.ac_valid) ac+=' ✓';$('acStatus').textContent=ac+(data.ac_duty_max>=0?(' max='+data.ac_duty_max.toFixed(1)+'%'):'');$('temp0').textContent=(data.temp0!=null)?data.temp0.toFixed(1):'—';$('temp1').textContent=(data.temp1!=null)?data.temp1.toFixed(1):'—';$('dscount').textContent=data.dscount;$('mode').textContent=data.mode?'Temp':'PS4';$('fail').textContent=data.fail?'YES':'no';if(data.config && !configLoaded){var defaultsReady=false;for(var k in defaults){if(defaults.hasOwnProperty(k)){defaultsReady=true;break;}}var allZero=true;for(var i=0;i<5;i++){var tk='t'+i; if(!data.config.hasOwnProperty(tk)){allZero=false;break;} if(parseFloat(data.config[tk])!==0){allZero=false;break;}}if((!data.curve_ok && allZero) || !defaultsReady){ if(__cfgTries<6){ if(window.console)console.warn('Deferring config apply (try '+__cfgTries+') curve_ok='+data.curve_ok+' allZero='+allZero+' defaultsReady='+defaultsReady); __cfgTries++; setTimeout(refresh,250); return; } else { if(window.console)console.warn('Applying config after max retries; using whatever values present'); } } loadConfigToUI(data.config); configLoaded=true;}});}";
   h+="function setupSliderListeners(){var sliders=[[\"vin_min_v\",3],[\"vin_max_v\",3],[\"lift_span\",1],[\"floor_pct\",1],[\"fan_max\",1],[\"attack_ms\",0],[\"temp_fail\",0],[\"node_v_min\",3],[\"node_v_max\",3],[\"cal_vin_off\",3],[\"cal_vin_gain\",3],[\"cal_vfan_off\",3],[\"cal_vfan_gain\",3]];";
   h+="for(var i=0;i<sliders.length;i++){var id=sliders[i][0],dec=sliders[i][1];var s=$(id);if(!s)continue;(function(id,dec,s){function handler(){updateDisplay(id,s.value,dec);if(id==='vin_min_v'||id==='vin_max_v')applyVinConstraints();}s.addEventListener('input',handler);s.addEventListener('change',handler);handler();})(id,dec,s);}";
   h+="if(!window.__mirror){window.__mirror=setInterval(function(){for(var i=0;i<sliders.length;i++){var id=sliders[i][0],dec=sliders[i][1];var s=$(id);if(s)updateDisplay(id,s.value,dec);}},700);} }";
@@ -1030,8 +1214,8 @@ String htmlPage(){
   h+="function closeHelp(){var o=$('helpOverlay');if(o)o.style.display='none';}";
   h+="function setupVinConstraints(){var a=$('vin_min_v'),b=$('vin_max_v');if(a&&b)applyVinConstraints();}";
   h+="function applyVinConstraints(){var a=$('vin_min_v'),b=$('vin_max_v');if(!a||!b)return;var vmin=parseFloat(a.value)||0.600;var vmax=parseFloat(b.value)||1.000;if(vmax<=vmin+0.010){vmax=vmin+0.020;b.value=vmax.toFixed(3);updateDisplay('vin_max_v',vmax,3);}b.min=(vmin+0.010).toFixed(3);a.max=(vmax-0.010).toFixed(3);}";
-  h+="function saveSettings(){var ids=['vin_min_v','vin_max_v','lift_span','floor_pct','fan_max','attack_ms','temp_fail','node_v_min','node_v_max','cal_vin_off','cal_vin_gain','cal_vfan_off','cal_vfan_gain'];var q='';for(var i=0;i<ids.length;i++){var e=$(ids[i]);if(e)q+=encodeURIComponent(ids[i])+'='+encodeURIComponent(e.value)+'&';}for(var i=0;i<5;i++){var t=$('t'+i),f=$('f'+i);if(t)q+='t'+i+'='+encodeURIComponent(t.value)+'&';if(f)q+='f'+i+'='+encodeURIComponent(f.value)+'&';}if(q.length>0)q=q.substring(0,q.length-1);xhrText('/set?'+q,function(err){if(err)alert('Save failed');else alert('Settings saved');});}";
-  h+="function resetParam(key){if(!defaults.hasOwnProperty(key))return;var e=$(key);if(!e)return;var info={'vin_min_v':3,'vin_max_v':3,'lift_span':1,'floor_pct':1,'fan_max':1,'attack_ms':0,'temp_fail':0,'node_v_min':3,'node_v_max':3,'cal_vin_off':3,'cal_vin_gain':3,'cal_vfan_off':3,'cal_vfan_gain':3};e.value=defaults[key];var dec=info.hasOwnProperty(key)?info[key]:1;updateDisplay(key,defaults[key],dec);if(key==='vin_min_v'||key==='vin_max_v')applyVinConstraints();}";
+  h+="function saveSettings(){var ids=['vin_min_v','vin_max_v','lift_span','floor_pct','fan_max','attack_ms','temp_fail','node_v_min','node_v_max','cal_vin_off','cal_vin_gain','cal_vfan_off','cal_vfan_gain','slp_v','slp_tC_max','slp_wake_tC_min','slp_t_ms','slp_w_ms','slp_v_hyst','slp_arm_samples','slp_min_awake_ms','slp_mode'];var q='';for(var i=0;i<ids.length;i++){var e=$(ids[i]);if(!e)continue;var v=(ids[i]=='slp_en')?(e.checked?1:0):e.value;q+=encodeURIComponent(ids[i])+'='+encodeURIComponent(v)+'&';}var slpEn=$('slp_en');if(slpEn)q+='slp_en='+(slpEn.checked?1:0)+'&';for(var i=0;i<5;i++){var t=$('t'+i),f=$('f'+i);if(t)q+='t'+i+'='+encodeURIComponent(t.value)+'&';if(f)q+='f'+i+'='+encodeURIComponent(f.value)+'&';}if(q.length>0)q=q.substring(0,q.length-1);xhrText('/set?'+q,function(err){if(err)alert('Save failed');else alert('Settings saved');});}";
+  h+="function resetParam(key){if(!defaults.hasOwnProperty(key))return;var e=$(key);if(!e)return;if(key==='slp_en'){e.checked=(defaults[key]==1||defaults[key]===true);return;}var info={'vin_min_v':3,'vin_max_v':3,'lift_span':1,'floor_pct':1,'fan_max':1,'attack_ms':0,'temp_fail':0,'node_v_min':3,'node_v_max':3,'cal_vin_off':3,'cal_vin_gain':3,'cal_vfan_off':3,'cal_vfan_gain':3,'slp_v':3,'slp_v_hyst':3,'slp_wake_tC_min':1};e.value=defaults[key];var dec=info.hasOwnProperty(key)?info[key]:(key.indexOf('_ms')>-1?0:1);updateDisplay(key,defaults[key],dec);if(key==='vin_min_v'||key==='vin_max_v')applyVinConstraints();}";
   h+="function resetTempPoint(i){var tk='t'+i,fk='f'+i;if(defaults.hasOwnProperty(tk))$('t'+i).value=defaults[tk];if(defaults.hasOwnProperty(fk))$('f'+i).value=defaults[fk];}";
   h+="function resetAllSettings(){var k;for(k in defaults){if(!defaults.hasOwnProperty(k))continue;var e=$(k);if(e){e.value=defaults[k];updateDisplay(k,defaults[k],3);}}setupVinConstraints();saveSettings();}";
   h+="function toggleMode(){xhrText('/toggle',function(){});}";
@@ -1042,6 +1226,12 @@ String htmlPage(){
   h+="function statObj(a){var n=a.length;var mn=a[0],mx=a[0],sum=0;for(var i=0;i<n;i++){var v=a[i];if(v<mn)mn=v;if(v>mx)mx=v;sum+=v;}return {min:mn,max:mx,cur:a[n-1],avg:sum/n,dp:(Math.abs(mx-mn)<5?2:1)};}";
   h+="function renderCharts(){xhrJSON('/history',function(err,a){if(err||!a||a.length<2)return;var xs=[],temps=[],duty=[],vfm=[];for(var i=0;i<a.length;i++){xs.push(a[i].t);temps.push(a[i].thot);duty.push(a[i].duty);vfm.push(a[i].vfanm);}var tmin=arrMin(temps,30),tmax=arrMax(temps,90);drawChart(document.getElementById('cTemp'),xs,temps,'#c00',tmin,tmax,'°C',statObj(temps));drawChart(document.getElementById('cFan'),xs,duty,'#06c',0,100,'Lift %',statObj(duty));var vmin=arrMin(vfm,0.8),vmax=arrMax(vfm,1.3);drawChart(document.getElementById('cVfan'),xs,vfm,'#090',vmin,vmax,'Vfan',statObj(vfm));});}";
   h+="function initializeUI(){setupSliderListeners();refresh();setInterval(refresh,1000);setInterval(renderCharts,2500);}";
+  // ---- Log panel JS ----
+  h+="var __logLast=0,__logPaused=false;";
+  h+="function buildCatMask(){var c=document.querySelectorAll('.logCat');var m=0;for(var i=0;i<c.length;i++){if(c[i].checked){m|=(1<<parseInt(c[i].value));}}return m;}";
+  h+="function fetchLog(){if(__logPaused)return;var sev=parseInt(document.getElementById('logSev').value);var mask=buildCatMask();var url='/log?since='+__logLast+'&sev='+sev+'&cat='+mask.toString(16);xhrJSON(url,function(err,d){if(err||!d||!d.entries)return;var v=document.getElementById('logView');for(var i=0;i<d.entries.length;i++){var e=d.entries[i];__logLast=e.id;var line='['+e.id+'] '+e.t_ms+'ms C'+e.cat+' S'+e.sev+' '+e.msg;v.textContent+=line+'\\n';}if(d.entries.length>0){v.scrollTop=v.scrollHeight;} });}";
+  h+="function setupLogUI(){var lc=document.getElementById('logClearBtn');if(lc)lc.onclick=function(){xhrJSON('/log?clear=1',function(){__logLast=0;document.getElementById('logView').textContent='';});};var pb=document.getElementById('logPauseBtn');if(pb)pb.onclick=function(){__logPaused=!__logPaused;pb.textContent=__logPaused?'Resume':'Pause';};var cats=document.querySelectorAll('.logCat');for(var i=0;i<cats.length;i++){cats[i].onchange=function(){__logLast=0;document.getElementById('logView').textContent='';};}document.getElementById('logSev').onchange=function(){__logLast=0;document.getElementById('logView').textContent='';};setInterval(fetchLog,1200);}";
+  h+="document.addEventListener('DOMContentLoaded',setupLogUI);";
   h+="if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',initializeUI);}else{initializeUI();}";
   h+="</script>";
 
@@ -1062,6 +1252,16 @@ void handleDefaults(){
   j+="\"fan_max\":"+String(D.fan_max,1)+",";
   j+="\"attack_ms\":"+String(D.attack_ms,1)+",";
   j+="\"temp_fail\":"+String(D.temp_fail,1)+",";
+  j+="\"slp_en\":"+String(D.slp_en?1:0)+",";
+  j+="\"slp_v\":"+String(D.slp_v,3)+",";
+  j+="\"slp_tC_max\":"+String(D.slp_tC_max,1)+",";
+  j+="\"slp_t_ms\":"+String(D.slp_t_ms)+",";
+  j+="\"slp_w_ms\":"+String(D.slp_w_ms)+",";
+  j+="\"slp_v_hyst\":"+String(D.slp_v_hyst,3)+","; // use struct default (updated default 0.100)
+  j+="\"slp_arm_samples\":"+String(3)+",";
+  j+="\"slp_min_awake_ms\":"+String(D.slp_min_awake_ms)+","; // use struct default (was hardcoded 15000)
+  j+="\"slp_mode\":"+String(0)+",";
+  j+="\"slp_wake_tC_min\":"+String(D.slp_wake_tC_min,1)+",";
   j+="\"cal_vin_off\":"+String(D.cal_vin_off,3)+",";
   j+="\"cal_vin_gain\":"+String(D.cal_vin_gain,3)+",";
   j+="\"cal_vfan_off\":"+String(D.cal_vfan_off,3)+",";
@@ -1081,6 +1281,9 @@ void handleSet(){
   float o_vin_min_v = vin_min_v, o_vin_max_v = vin_max_v, o_floor_pct = floor_pct, o_lift_span=lift_span, o_fan_max=fan_max;
   float o_attack_ms=attack_ms, o_temp_fail=temp_fail, o_node_v_min=node_v_min, o_node_v_max=node_v_max;
   float o_cal_vin_off=cal_vin_off, o_cal_vin_gain=cal_vin_gain, o_cal_vfan_off=cal_vfan_off, o_cal_vfan_gain=cal_vfan_gain;
+  // Snapshot sleep params before modification for echo
+  bool  o_slp_en = slp_en; float o_slp_v = slp_v; float o_slp_tC_max = slp_tC_max; uint32_t o_slp_t_ms = slp_t_ms; uint32_t o_slp_w_ms = slp_w_ms;
+  float o_slp_v_hyst = slp_v_hyst; uint8_t o_slp_arm_samples = slp_arm_samples; uint32_t o_slp_min_awake_ms = slp_min_awake_ms; uint8_t o_slp_mode = slp_mode;
   bool  o_use_temp_mode = use_temp_mode; // currently not settable via /set, but keep pattern
   // read args
   // test_v removed
@@ -1097,6 +1300,24 @@ void handleSet(){
   if(server.hasArg("cal_vin_gain")) cal_vin_gain= server.arg("cal_vin_gain").toFloat();
   if(server.hasArg("cal_vfan_off")) cal_vfan_off= server.arg("cal_vfan_off").toFloat();
   if(server.hasArg("cal_vfan_gain"))cal_vfan_gain=server.arg("cal_vfan_gain").toFloat();
+  // Sleep parameters
+  // WiFi station credentials
+  bool wifi_changed=false; bool haveWifiArg=false;
+  if(server.hasArg("wifi_ssid")){ String v=server.arg("wifi_ssid"); v.trim(); wifi_ssid = v; haveWifiArg=true; wifi_changed=true; }
+  if(server.hasArg("wifi_pass")){ String v=server.arg("wifi_pass"); v.trim(); wifi_pass = v; haveWifiArg=true; wifi_changed=true; }
+  if(server.hasArg("wifi_conn_ms")){ uint32_t t = (uint32_t) server.arg("wifi_conn_ms").toInt(); if(t<2000) t=2000; if(t>20000) t=20000; wifi_conn_ms=t; }
+  if(server.hasArg("slp_en")){
+    String v=server.arg("slp_en"); v.toLowerCase();
+    if(v=="1"||v=="true"||v=="on") slp_en=true; else if(v=="0"||v=="false"||v=="off") slp_en=false;
+  }
+  if(server.hasArg("slp_v")) slp_v = server.arg("slp_v").toFloat();
+  if(server.hasArg("slp_tC_max")) slp_tC_max = server.arg("slp_tC_max").toFloat();
+  if(server.hasArg("slp_t_ms")) slp_t_ms = (uint32_t) server.arg("slp_t_ms").toInt();
+  if(server.hasArg("slp_w_ms")) slp_w_ms = (uint32_t) server.arg("slp_w_ms").toInt();
+  if(server.hasArg("slp_v_hyst")) slp_v_hyst = server.arg("slp_v_hyst").toFloat();
+  if(server.hasArg("slp_arm_samples")) slp_arm_samples = (uint8_t) constrain(server.arg("slp_arm_samples").toInt(),1,20);
+  if(server.hasArg("slp_min_awake_ms")) slp_min_awake_ms = (uint32_t) server.arg("slp_min_awake_ms").toInt();
+  if(server.hasArg("slp_mode")) { int m = server.arg("slp_mode").toInt(); if(m>=0 && m<=3) slp_mode = (uint8_t)m; }
   // Optional calibration injection via /set
   if(server.hasArg("cal_dutyB_max")){
     float v = server.arg("cal_dutyB_max").toFloat();
@@ -1166,6 +1387,15 @@ void handleSet(){
 
   cal_vin_gain  = sane(cal_vin_gain,  0.80f, 1.20f, D.cal_vin_gain);
   cal_vfan_gain = sane(cal_vfan_gain, 0.80f, 1.20f, D.cal_vfan_gain);
+  // Sleep sanitize
+  slp_v = sane(slp_v, 0.00f, 1.20f, D.slp_v);
+  slp_tC_max = sane(slp_tC_max, 5.0f, 90.0f, D.slp_tC_max);
+  if(slp_t_ms < 1000) slp_t_ms = 1000; if(slp_t_ms > 600000) slp_t_ms = 600000;
+  if(slp_w_ms < 500)  slp_w_ms = 500;  if(slp_w_ms > 600000) slp_w_ms = 600000;
+  if(slp_v_hyst < 0.001f) slp_v_hyst = 0.001f; if(slp_v_hyst > 0.500f) slp_v_hyst = 0.500f; // expanded max from 0.050 to 0.500
+  if(slp_arm_samples < 1) slp_arm_samples = 1; if(slp_arm_samples > 20) slp_arm_samples = 20;
+  if(slp_min_awake_ms > 600000) slp_min_awake_ms = 600000;
+  if(slp_mode > 3) slp_mode = 0;
   cal_vin_off   = sane(cal_vin_off,  -0.50f, 0.50f, D.cal_vin_off);
   cal_vfan_off  = sane(cal_vfan_off, -0.50f, 0.50f, D.cal_vfan_off);
 
@@ -1185,12 +1415,26 @@ void handleSet(){
   prefs.putFloat("cal_vin_gain", cal_vin_gain);
   prefs.putFloat("cal_vfan_off", cal_vfan_off);
   prefs.putFloat("cal_vfan_gain",cal_vfan_gain);
+  prefs.putFloat("slp_v_hyst", slp_v_hyst);
+  prefs.putUChar("slp_arm_samples", slp_arm_samples);
+  prefs.putUInt("slp_min_aw", slp_min_awake_ms); // migrated short key
+  prefs.putUChar("slp_mode", slp_mode);
+  prefs.putBool("slp_en", slp_en);
+  prefs.putFloat("slp_v", slp_v);
+  prefs.putFloat("slp_tC_max", slp_tC_max);
+  prefs.putUInt("slp_t_ms", slp_t_ms);
+  prefs.putUInt("slp_w_ms", slp_w_ms);
+  // WiFi creds
+  prefs.putString("wifi_ssid", wifi_ssid);
+  prefs.putString("wifi_pass", wifi_pass);
+  prefs.putUInt("wifi_conn_ms", wifi_conn_ms);
   for(int i=0;i<5;i++){
     prefs.putFloat(("t"+String(i)).c_str(),temp_pt[i]);
     prefs.putFloat(("f"+String(i)).c_str(),fan_pt[i]);
   }
   prefs.putBool("mode",use_temp_mode);
   prefs.end();
+  Serial.printf("[BOOT] Loaded slp_min_awake_ms=%lu (default=%lu)\n", (unsigned long)slp_min_awake_ms, (unsigned long)D.slp_min_awake_ms);
   // Build concise serial echo of what changed (only keys supplied)
   if(Serial){
     String msg = "[/set]";
@@ -1208,10 +1452,62 @@ void handleSet(){
     appendIf("cal_vin_gain", server.hasArg("cal_vin_gain"), o_cal_vin_gain, cal_vin_gain, 3);
     appendIf("cal_vfan_off", server.hasArg("cal_vfan_off"), o_cal_vfan_off, cal_vfan_off, 3);
     appendIf("cal_vfan_gain", server.hasArg("cal_vfan_gain"), o_cal_vfan_gain, cal_vfan_gain, 3);
+  appendIf("slp_en", server.hasArg("slp_en"), o_slp_en?1:0, slp_en?1:0, 0);
+  appendIf("slp_v", server.hasArg("slp_v"), o_slp_v, slp_v, 3);
+  appendIf("slp_tC_max", server.hasArg("slp_tC_max"), o_slp_tC_max, slp_tC_max, 1);
+  appendIf("slp_t_ms", server.hasArg("slp_t_ms"), (float)o_slp_t_ms, (float)slp_t_ms, 0);
+  appendIf("slp_w_ms", server.hasArg("slp_w_ms"), (float)o_slp_w_ms, (float)slp_w_ms, 0);
+  appendIf("slp_v_hyst", server.hasArg("slp_v_hyst"), o_slp_v_hyst, slp_v_hyst, 3);
+  appendIf("slp_arm_samples", server.hasArg("slp_arm_samples"), (float)o_slp_arm_samples, (float)slp_arm_samples, 0);
+  appendIf("slp_min_awake_ms", server.hasArg("slp_min_awake_ms"), (float)o_slp_min_awake_ms, (float)slp_min_awake_ms, 0);
+  appendIf("slp_mode", server.hasArg("slp_mode"), (float)o_slp_mode, (float)slp_mode, 0);
+    if(haveWifiArg){ msg += " wifi="; msg += (wifi_ssid.length()?wifi_ssid:"<blank>"); }
     if(anyCurveProvided){
       if(!anyNonZero) msg += " curve=ignored_all_zero"; else msg += " curve=updated"; }
     if(msg=="[/set]") msg += " no_changes";
     Serial.println(msg);
+    // Log condensed change summary (truncate for log buffer)
+    String lmsg = msg;
+    if(lmsg.length() > 120) lmsg = lmsg.substring(0,117)+"...";
+    LOG_INFO(LOGC_SET, "%s", lmsg.c_str());
+    // Per-parameter logs for visibility in web console (only when actually changed and arg provided)
+    auto logParam=[&](const char* key,bool hadArg,float oldVal,float newVal,int prec){
+      if(!hadArg) return; if(fabs(newVal-oldVal) < 0.0005f) return; // unchanged
+      char buf[64]; dtostrf(newVal,0,prec,buf);
+      LOG_INFO(LOGC_SET, "%s=%s", key, buf);
+    };
+    logParam("vin_min_v", server.hasArg("vin_min_v"), o_vin_min_v, vin_min_v, 3);
+    logParam("vin_max_v", server.hasArg("vin_max_v"), o_vin_max_v, vin_max_v, 3);
+    logParam("floor_pct", server.hasArg("floor_pct"), o_floor_pct, floor_pct, 1);
+    logParam("lift_span", server.hasArg("lift_span"), o_lift_span, lift_span, 1);
+    logParam("fan_max", server.hasArg("fan_max"), o_fan_max, fan_max, 1);
+    logParam("attack_ms", server.hasArg("attack_ms"), o_attack_ms, attack_ms, 0);
+    logParam("temp_fail", server.hasArg("temp_fail"), o_temp_fail, temp_fail, 1);
+    logParam("node_v_min", server.hasArg("node_v_min"), o_node_v_min, node_v_min, 3);
+    logParam("node_v_max", server.hasArg("node_v_max"), o_node_v_max, node_v_max, 3);
+    logParam("cal_vin_off", server.hasArg("cal_vin_off"), o_cal_vin_off, cal_vin_off, 3);
+    logParam("cal_vin_gain", server.hasArg("cal_vin_gain"), o_cal_vin_gain, cal_vin_gain, 3);
+    logParam("cal_vfan_off", server.hasArg("cal_vfan_off"), o_cal_vfan_off, cal_vfan_off, 3);
+    logParam("cal_vfan_gain", server.hasArg("cal_vfan_gain"), o_cal_vfan_gain, cal_vfan_gain, 3);
+    logParam("slp_en", server.hasArg("slp_en"), o_slp_en?1:0, slp_en?1:0, 0);
+    logParam("slp_v", server.hasArg("slp_v"), o_slp_v, slp_v, 3);
+    logParam("slp_tC_max", server.hasArg("slp_tC_max"), o_slp_tC_max, slp_tC_max, 1);
+    logParam("slp_t_ms", server.hasArg("slp_t_ms"), (float)o_slp_t_ms, (float)slp_t_ms, 0);
+    logParam("slp_w_ms", server.hasArg("slp_w_ms"), (float)o_slp_w_ms, (float)slp_w_ms, 0);
+    logParam("slp_v_hyst", server.hasArg("slp_v_hyst"), o_slp_v_hyst, slp_v_hyst, 3);
+    logParam("slp_arm_samples", server.hasArg("slp_arm_samples"), (float)o_slp_arm_samples, (float)slp_arm_samples, 0);
+    logParam("slp_min_awake_ms", server.hasArg("slp_min_awake_ms"), (float)o_slp_min_awake_ms, (float)slp_min_awake_ms, 0);
+    logParam("slp_mode", server.hasArg("slp_mode"), (float)o_slp_mode, (float)slp_mode, 0);
+    // Also emit sleep-category specific logs for mode / enable toggles so they show under SLP filter
+    if(server.hasArg("slp_mode") && o_slp_mode != slp_mode){
+      LOG_INFO(LOGC_SLP, "mode %u->%u (%s)", (unsigned)o_slp_mode, (unsigned)slp_mode,
+        slp_mode==0?"VIN_AND_TEMP": slp_mode==1?"VIN_ONLY": slp_mode==2?"TEMP_ONLY":"VIN_OR_TEMP");
+    }
+    if(server.hasArg("slp_en") && (o_slp_en?1:0) != (slp_en?1:0)){
+      LOG_INFO(LOGC_SLP, "slp_en %d->%d", o_slp_en?1:0, slp_en?1:0);
+    }
+    if(haveWifiArg){ LOG_INFO(LOGC_SET, "wifi_ssid=%s", wifi_ssid.c_str()); }
+    if(anyCurveProvided && anyNonZero){ for(int i=0;i<5;i++){ char tkey[6]; sprintf(tkey,"t%d",i); LOG_INFO(LOGC_SET, "%s=%.1f", tkey, temp_pt[i]); char fkey[6]; sprintf(fkey,"f%d",i); LOG_INFO(LOGC_SET, "%s=%.1f", fkey, fan_pt[i]); } }
   }
 
   server.send(200,"text/plain","OK");
@@ -1229,7 +1525,8 @@ void handleJson(){
   for(int i=0;i<5;i++){ Serial.print(fan_pt[i]); Serial.print(i<4?',':' ');} Serial.println();
   #endif
   }
-  String j="{";
+  String j="{"; // build JSON (reserve to mitigate heap fragmentation)
+  j.reserve(2600);
   // Determine if curve appears intentionally populated (not all zeros)
   bool curve_ok=false; for(int i=0;i<5;i++){ if(temp_pt[i]!=0 || fan_pt[i]!=0){ curve_ok=true; break; } }
   // test_v removed from /json live
@@ -1268,12 +1565,21 @@ void handleJson(){
   j+="\"window_bypass\":" + String(window_bypass?"true":"false") + ",";
   j+="\"window_bypass_force\":" + String(window_bypass_force?"true":"false") + ",";
   j+="\"raw_override\":" + String(raw_override?"true":"false") + ",";
+  // WiFi status
+  if(wifi_sta_connected){
+    j+="\"wifi_mode\":\"sta\",";
+    j+="\"wifi_ip\":\""+wifi_ip_str+"\",";
+    j+="\"wifi_rssi\":"+String(WiFi.RSSI())+",";
+  } else {
+    j+="\"wifi_mode\":\"" + String(wifi_started_ap?"ap":"none") + "\",";
+  }
   // Sleep feature status
   j+="\"slp_en\":" + String(slp_en?"true":"false") + ",";
   j+="\"slp_v\":" + String(slp_v,3) + ",";
   j+="\"slp_tC_max\":" + String(slp_tC_max,1) + ",";
   j+="\"slp_t_ms\":" + String((unsigned long)slp_t_ms) + ",";
   j+="\"slp_w_ms\":" + String((unsigned long)slp_w_ms) + ",";
+  j+="\"slp_wake_tC_min\":" + String(slp_wake_tC_min,1) + ",";
   j+="\"slp_pending\":" + String(slp_pending?"true":"false") + ",";
   if(slp_pending){ unsigned long remain = 0; if(slp_cond_start_ms>0){ unsigned long el = millis() - slp_cond_start_ms; if(el < slp_t_ms) remain = slp_t_ms - el; }
     j+="\"slp_remain_ms\":" + String(remain) + ","; }
@@ -1303,6 +1609,16 @@ void handleJson(){
   j+="\"fan_max\":"+String(fan_max,1)+",";
   j+="\"attack_ms\":"+String(attack_ms,1)+",";
   j+="\"temp_fail\":"+String(temp_fail,1)+",";
+  j+="\"slp_en\":"+String(slp_en?1:0)+",";
+  j+="\"slp_v\":"+String(slp_v,3)+",";
+  j+="\"slp_tC_max\":"+String(slp_tC_max,1)+",";
+  j+="\"slp_wake_tC_min\":"+String(slp_wake_tC_min,1)+",";
+  j+="\"slp_t_ms\":"+String((unsigned long)slp_t_ms)+",";
+  j+="\"slp_w_ms\":"+String((unsigned long)slp_w_ms)+",";
+  j+="\"slp_v_hyst\":"+String(slp_v_hyst,3)+",";
+  j+="\"slp_arm_samples\":"+String(slp_arm_samples)+",";
+  j+="\"slp_min_awake_ms\":"+String((unsigned long)slp_min_awake_ms)+",";
+  j+="\"slp_mode\":"+String(slp_mode)+",";
   j+="\"cal_vin_off\":"+String(cal_vin_off,3)+",";
   j+="\"cal_vin_gain\":"+String(cal_vin_gain,3)+",";
   j+="\"cal_vfan_off\":"+String(cal_vfan_off,3)+",";
@@ -1330,11 +1646,47 @@ void handleHistory(){
   server.send(200,"application/json",j);
 }
 
+void handleLog(){
+  // Query params: since (id), max (count), sev (min severity), cat (bitmask), clear=1
+  if(server.hasArg("clear")){
+    log_clear();
+    server.send(200, "application/json", "{\"cleared\":true}");
+    return;
+  }
+  uint32_t since = server.hasArg("since") ? (uint32_t) strtoul(server.arg("since").c_str(),nullptr,10) : 0;
+  int maxReq = server.hasArg("max") ? server.arg("max").toInt() : 40; if(maxReq<1) maxReq=1; if(maxReq> (int)LOG_CAPACITY) maxReq = LOG_CAPACITY;
+  int sevMin = server.hasArg("sev") ? server.arg("sev").toInt() : 0; if(sevMin<0) sevMin=0; if(sevMin>3) sevMin=3;
+  uint32_t catMask = server.hasArg("cat") ? (uint32_t) strtoul(server.arg("cat").c_str(),nullptr,16) : 0xFFFFFFFFUL;
+  // Build JSON
+  String j="{\"capacity\":"+String(LOG_CAPACITY)+",\"count\":"+String(log_count)+",\"next_id\":"+String(log_next_id)+",\"entries\":[";
+  // Iterate from oldest logical entry
+  int emitted=0;
+  if(log_count>0){
+    int oldest = (log_head - log_count + LOG_CAPACITY) % LOG_CAPACITY;
+    for(int i=0;i<log_count;i++){
+      LogEntry &e = log_buf[(oldest + i) % LOG_CAPACITY];
+      if(e.id <= since) continue; // incremental fetch
+      if(e.sev < sevMin) continue;
+      if(catMask != 0xFFFFFFFFUL){ uint32_t bit = (1u << e.cat); if((catMask & bit)==0) continue; }
+      if(emitted>0) j+=",";
+      j+="{\"id\":"+String(e.id)+",\"t_ms\":"+String(e.t_ms)+",\"cat\":"+String(e.cat)+",\"sev\":"+String(e.sev)+",\"msg\":\"";
+      // escape quotes/backslashes in msg
+      for(const char *p=e.msg; *p; ++p){ char c=*p; if(c=='\\' || c=='\"') j+='\\'; if(c=='\n' || c=='\r') continue; j+=c; }
+      j+="\"}";
+      emitted++;
+      if(emitted>=maxReq) break;
+    }
+  }
+  j+="]}";
+  server.send(200,"application/json",j);
+}
+
 void handleToggle(){
   use_temp_mode=!use_temp_mode;
   prefs.begin("fan",false);
   prefs.putBool("mode",use_temp_mode);
   prefs.end();
+  LOG_INFO(LOGC_SET, "mode=%s", use_temp_mode?"temp":"ps4");
   server.send(200,"text/plain",use_temp_mode?"Temp mode":"PS4 mode");
 }
 
@@ -1393,6 +1745,23 @@ void setup(){
   Serial.printf("Chip rev: %d  SDK: %s\n", ESP.getChipRevision(), ESP.getSdkVersion());
   Serial.println("Init peripherals...");
   Serial.flush();
+  LOG_INFO(LOGC_PWR, "boot heap=%u", (unsigned)ESP.getFreeHeap());
+
+  // Report wake cause (helps diagnose immediate wake complaints)
+  esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
+  Serial.printf("[BOOT] Wake cause=%d\n", (int)wc);
+  LOG_INFO(LOGC_SLP, "wake cause=%d", (int)wc);
+  // Mark start of a probe cycle after timer wake; cleared when wake criteria satisfied
+  if(wc == ESP_SLEEP_WAKEUP_TIMER){ slp_probe_active = true; slp_probe_logged = false; }
+  // If this was a deep sleep wake, initialize last wake timestamp so optional min-awake logic can apply
+  if(wc != ESP_SLEEP_WAKEUP_UNDEFINED){
+    slp_last_wake_ms = millis();
+  }
+
+  // Ensure any deep-sleep GPIO holds from prior session are released so PWM can re-init
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis((gpio_num_t)PIN_PWM_A);
+  gpio_hold_dis((gpio_num_t)PIN_PWM_B);
 
   analogReadResolution(12);
   analogSetPinAttenuation(PIN_PS4_IN, ADC_11db);  // 0..~3.3 V
@@ -1425,6 +1794,7 @@ void setup(){
   attack_ms=prefs.getFloat("attack_ms",attack_ms);
   temp_fail=prefs.getFloat("temp_fail",temp_fail);
   use_temp_mode=prefs.getBool("mode",use_temp_mode);
+  LOG_INFO(LOGC_SET, "prefs floor=%.1f lift=%.1f mode=%s", floor_pct, lift_span, use_temp_mode?"temp":"ps4");
   cal_vin_off  = prefs.getFloat("cal_vin_off",  cal_vin_off);
   cal_vin_gain = prefs.getFloat("cal_vin_gain", cal_vin_gain);
   cal_vfan_off = prefs.getFloat("cal_vfan_off", cal_vfan_off);
@@ -1438,6 +1808,20 @@ void setup(){
   v_bias        = prefs.getFloat("v_bias", v_bias);
   wA_eff        = prefs.getFloat("wA_eff", wA_eff);
   wB_eff        = prefs.getFloat("wB_eff", wB_eff);
+  // Extended sleep params
+  slp_v_hyst       = prefs.getFloat("slp_v_hyst", slp_v_hyst);
+  slp_arm_samples  = prefs.getUChar("slp_arm_samples", slp_arm_samples);
+  // Migrate min awake key: old 'slp_min_awake_ms' >15 chars (NVS limit) -> KEY_TOO_LONG. New key 'slp_min_aw'.
+  if(prefs.isKey("slp_min_aw")){
+    slp_min_awake_ms = prefs.getUInt("slp_min_aw", slp_min_awake_ms);
+  } else if(prefs.isKey("slp_min_awake_ms")) {
+    slp_min_awake_ms = prefs.getUInt("slp_min_awake_ms", slp_min_awake_ms);
+    Preferences p_mig; p_mig.begin("fan", false); p_mig.putUInt("slp_min_aw", slp_min_awake_ms); p_mig.end();
+    Serial.printf("[BOOT] Migrated slp_min_awake_ms -> slp_min_aw (%lu)\n", (unsigned long)slp_min_awake_ms);
+    LOG_INFO(LOGC_SET, "migrate slp_min_aw=%lu", (unsigned long)slp_min_awake_ms);
+  }
+  slp_mode         = prefs.getUChar("slp_mode", slp_mode);
+  slp_wake_tC_min  = prefs.getFloat("slp_wake_tC_min", slp_wake_tC_min);
   // Baseline measurement key migration: old key "cal_baseline_meas" (>15 chars) caused KEY_TOO_LONG error.
   // New shorter key: "cb_meas". Load new key first; if absent, try old, then persist under new key.
   if(prefs.isKey("cb_meas")){
@@ -1462,6 +1846,7 @@ void setup(){
   learn_alpha_last_saved = learn_alpha;
   learn_alpha_frozen = prefs.getBool("alpha_frozen", false);
   prefs.end();
+  Serial.printf("[BOOT] MinAwake loaded=%lu default=%lu\n", (unsigned long)slp_min_awake_ms, (unsigned long)D.slp_min_awake_ms);
   // Re-apply PWM frequency if different from compile-time default
   auto applyPwmFreq=[&](){
     applyPwmFrequencySafe(pwm_freq_hz, true);
@@ -1511,19 +1896,35 @@ void setup(){
   vin_max_v = sane(vin_max_v, 0.40f, 1.20f, D.vin_max_v);
   if (vin_max_v <= vin_min_v + 0.01f) { vin_max_v = vin_min_v + 0.02f; }
 
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(ssid,password);
+  // Load WiFi credentials (after prefs.end above) in read-only reopen.
+  // Only overwrite compiled defaults if keys actually exist so factory reset falls back to hardcoded SSID/PASS.
+  prefs.begin("fan", true);
+  bool have_ssid = prefs.isKey("wifi_ssid");
+  bool have_pass = prefs.isKey("wifi_pass");
+  if(have_ssid) wifi_ssid = prefs.getString("wifi_ssid", wifi_ssid);
+  if(have_pass) wifi_pass = prefs.getString("wifi_pass", wifi_pass);
+  bool have_conn = prefs.isKey("wifi_conn_ms");
+  if(have_conn) wifi_conn_ms = prefs.getUInt("wifi_conn_ms", wifi_conn_ms);
+  prefs.end();
+  if(Serial){
+    Serial.printf("[BOOT] WiFi creds source: ssid=%s (from %s) timeout=%lu\n", wifi_ssid.c_str(), (have_ssid?"prefs":"defaults"), (unsigned long)wifi_conn_ms);
+  }
+
+  // Unified WiFi attempt (STA first, fallback AP)
+  attemptWifi();
 
   server.on("/",handleRoot);
   server.on("/set",handleSet);
   server.on("/json",handleJson);
   server.on("/history",handleHistory);
+  server.on("/log",handleLog);
   server.on("/toggle",handleToggle);
   server.on("/defaults",handleDefaults);
   server.on("/factory",handleFactory);
   server.on("/reboot",handleReboot);
   server.on("/autocal",handleAutoCal);
   server.begin();
+  LOG_INFO(LOGC_NET, "http ready");
 }
 
 void loop(){
@@ -1610,7 +2011,59 @@ void loop(){
           if(!dump_follow) Serial.println("=== END ===");
           dump_follow_last = millis();
         } else if(cmd.equalsIgnoreCase("help") || cmd.equalsIgnoreCase("h")){
-          Serial.println("Commands: dump(d) dump f|follow dumpjson(dj) save ac acstop calreset calinject floor= dutyB= alphafreeze [val] alphafreeclear raw [off|a= b=] bypass [on|off] set key=val pwmfreq [Hz] vinraw vinmode [robust|legacy] learn history fh fasthist factory reboot restart toggle help");
+          Serial.println("Commands: dump(d) dump f|follow dumpjson(dj) wifi wifiretry wifiset ssid=<s> pass=<p> [to=<ms>] save ac acstop calreset calinject floor= dutyB= alphafreeze [val] alphafreeclear raw [off|a= b=] bypass [on|off] set key=val pwmfreq [Hz] vinraw vinmode [robust|legacy] learn history fh fasthist factory reboot restart toggle help");
+        } else if(cmd.equalsIgnoreCase("wifi")){
+          // Show current WiFi status (mode/IP/RSSI/SSID/connect timeout)
+          wl_status_t st = WiFi.status();
+          String mode;
+          if(wifi_sta_connected){ mode = "STA"; }
+          else if(wifi_started_ap){ mode = "AP"; }
+          else if(st==WL_NO_SSID_AVAIL || st==WL_CONNECT_FAILED || st==WL_IDLE_STATUS){ mode = "FAIL"; }
+          else { mode = "NONE"; }
+          String ip = wifi_ip_str.length() ? wifi_ip_str : String("0.0.0.0");
+          int32_t rssi = (wifi_sta_connected && st==WL_CONNECTED) ? WiFi.RSSI() : 0;
+          Serial.printf("[WIFI] mode=%s ip=%s", mode.c_str(), ip.c_str());
+          if(mode=="STA"){
+            Serial.printf(" rssi=%ddBm", (int)rssi);
+          }
+          if(wifi_ssid.length()){
+            Serial.printf(" ssid='%s'", wifi_ssid.c_str());
+          }
+          Serial.printf(" conn_timeout_ms=%lu", (unsigned long)wifi_conn_ms);
+          if(!wifi_sta_connected && wifi_ssid.length()>0 && !wifi_started_ap){
+            // We tried STA but not yet AP fallback (shouldn't occur after setup, but guard)
+            unsigned long el = millis() - wifi_connect_start;
+            Serial.printf(" elapsed_attempt_ms=%lu", (unsigned long)el);
+          }
+          Serial.println();
+        } else if(cmd.equalsIgnoreCase("wifiretry")){
+          Serial.println("[WIFI] Retrying STA/AP sequence...");
+          attemptWifi(true);
+          wl_status_t st2 = WiFi.status();
+          Serial.printf("[WIFI] Result: %s ip=%s mode=%s\n", wifiStatusStr(st2), wifi_ip_str.c_str(), wifi_sta_connected?"STA":(wifi_started_ap?"AP":"NONE"));
+        } else if(cmd.startsWith("wifiset")){
+          // wifiset ssid=MyNet pass=Secret123 to=12000
+          String rest = lastRawLine.substring(String("wifiset").length()); rest.trim();
+          if(rest.length()==0){
+            Serial.println("Usage: wifiset ssid=<ssid> pass=<pw> [to=<ms>] (omit pass= to keep existing, ssid='' clears)");
+          } else {
+            String newS = wifi_ssid; String newP = wifi_pass; uint32_t newTO = wifi_conn_ms; bool chS=false,chP=false,chT=false;
+            while(rest.length()>0){
+              int sp = rest.indexOf(' '); String tok = (sp==-1)?rest:rest.substring(0,sp); if(sp==-1) rest=""; else rest=rest.substring(sp+1); tok.trim(); if(!tok.length()) continue;
+              int eq=tok.indexOf('='); if(eq<=0) continue; String k=tok.substring(0,eq); String v=tok.substring(eq+1); k.trim(); v.trim();
+              if(k.equalsIgnoreCase("ssid")){ newS=v; chS=true; }
+              else if(k.equalsIgnoreCase("pass")){ newP=v; chP=true; }
+              else if(k.equalsIgnoreCase("to")){ uint32_t t=v.toInt(); if(t<2000) t=2000; if(t>30000) t=30000; newTO=t; chT=true; }
+            }
+            wifi_ssid = newS; wifi_pass = newP; wifi_conn_ms = newTO;
+            prefs.begin("fan", false);
+            prefs.putString("wifi_ssid", wifi_ssid);
+            prefs.putString("wifi_pass", wifi_pass);
+            prefs.putUInt("wifi_conn_ms", wifi_conn_ms);
+            prefs.end();
+            Serial.printf("[WIFI] Updated creds ssid='%s' to=%lu%s%s\n", wifi_ssid.c_str(), (unsigned long)wifi_conn_ms, chP?" (pass set)":"", (wifi_ssid.length()==0)?" (cleared -> AP only)":"");
+            attemptWifi(true);
+          }
         } else if(cmd.equalsIgnoreCase("dumpjson") || cmd.equalsIgnoreCase("dj")){
           // produce single-line JSON for machine ingest
           String j="{";
@@ -1879,7 +2332,7 @@ void loop(){
               }
               else if(key=="cal_floor_lock"){ if(valStr.equalsIgnoreCase("on")||valStr=="1") cal_floor_lock=true; else if(valStr.equalsIgnoreCase("off")||valStr=="0") cal_floor_lock=false; else ok=false; }
               else if(key=="slp_en"){ if(valStr.equalsIgnoreCase("on")||valStr=="1") slp_en=true; else if(valStr.equalsIgnoreCase("off")||valStr=="0") slp_en=false; else ok=false; }
-              else if(key=="slp_v"){ slp_v = sane(val,0.30f,1.20f,D.slp_v); }
+              else if(key=="slp_v"){ slp_v = sane(val,0.00f,1.20f,D.slp_v); }
               else if(key=="slp_tC_max"){ slp_tC_max = sane(val,5.0f,90.0f,D.slp_tC_max); }
               else if(key=="slp_t_ms"){ if(val<1000) val=1000; if(val>600000) val=600000; slp_t_ms = (uint32_t)val; }
               else if(key=="slp_w_ms"){ if(val<500) val=500; if(val>600000) val=600000; slp_w_ms = (uint32_t)val; }
@@ -2176,33 +2629,6 @@ void loop(){
       clrLine(); Serial.print("(press any key to exit follow)\n");
       dump_follow_last = now;
     }
-  }
-  // ---- Sleep condition evaluation (after control & adaptation) ----
-  if(slp_en && (millis() > SLP_BOOT_GRACE_MS) && !raw_override && ac_state==AC_IDLE && !fan_fail){
-    bool temp_ok = tempValid(temp_hot) ? (temp_hot < slp_tC_max) : false; // require valid temp
-    bool vin_ok  = (!use_temp_mode) ? (vin_now>0 && vin_now < slp_v) : false; // only consider vin while in PS4 mode
-    bool cond = (temp_ok && vin_ok);
-    if(cond){
-      if(!slp_armed){ slp_armed=true; slp_cond_start_ms = millis(); }
-      unsigned long dwell = millis() - slp_cond_start_ms;
-      slp_pending = true;
-      if(dwell >= slp_t_ms){
-        // Enter deep sleep. Configure timer wake.
-        if(Serial){ Serial.printf("[SLEEP] Entering deep sleep (vin=%.3f < %.3f, temp=%.1f < %.1f) for %lums\n", vin_now, slp_v, temp_hot, slp_tC_max, (unsigned long)slp_w_ms); Serial.flush(); }
-        // Prepare minimal state (nothing special right now). Stop WiFi to reduce current.
-        WiFi.mode(WIFI_OFF);
-        esp_sleep_enable_timer_wakeup( (uint64_t)slp_w_ms * 1000ULL );
-        // Put PWMs to safe state (floor still applied; acceptable). Optionally could disable.
-        delay(50);
-        esp_deep_sleep_start();
-      }
-    } else {
-      // reset tracking
-      slp_armed=false; slp_cond_start_ms=0; slp_pending=false;
-    }
-  } else {
-    // Feature disabled or conditions suppressed
-    slp_armed=false; slp_cond_start_ms=0; slp_pending=false;
   }
   // (Heartbeat removed to reduce serial noise)
 }
