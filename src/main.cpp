@@ -8,6 +8,9 @@
 #include <driver/gpio.h>   // for gpio hold (ensure pins held low in deep sleep)
 #include <stdarg.h>
 
+// -------- DEBUG LOGGING ----------
+#define ENABLE_LOG_DEBUG  // Enable debug messages in web UI event log
+
 // -------- PINS / PWM ----------
 #define PWM_FREQ_HZ      31250  // default PWM frequency (Hz)
 #define PWM_RES_BITS     10        // C3: 10-bit at 31.25 kHz works (12-bit would fail)
@@ -158,12 +161,16 @@ struct Defaults {
   float node_v_max = 1.180f;   // voltage window max
   float cal_vin_gain  = 1.000f, cal_vin_off  = 0.000f;
   float cal_vfan_gain = 1.000f, cal_vfan_off = 0.000f;
+  // VIN smoothing parameters
+  uint32_t vin_samples = 31;       // ADC samples for trimmed mean (21-51 range)
+  float vin_alpha_fast = 0.15f;    // fast IIR filter alpha (0.05-0.30)
+  float vin_alpha_slow = 0.05f;    // slow IIR filter alpha (0.01-0.15)
   // Sleep defaults
   bool  slp_en      = false;    // disabled by default until user enables
   float slp_v       = 0.55f;    // Vin below this considered "PS4 sleeping" (after calibration)
   float slp_tC_max  = 45.0f;    // Only sleep if hottest temp BELOW this (safety)
   uint32_t slp_t_ms = 10000;    // dwell time (ms) that conditions must persist before deep sleep
-  uint32_t slp_w_ms = 2000;     // wake probe interval (ms) (converted to deep sleep timer)
+  uint32_t slp_w_ms = 10000;    // wake probe interval (ms) (converted to deep sleep timer)
   float    slp_wake_tC_min = 35.0f; // minimum temp required to allow wake (console producing heat)
   float    slp_v_hyst = 0.100f; // default VIN hysteresis band (raise from 0.010 to 0.100)
   uint32_t slp_min_awake_ms = 45000; // default minimum awake interval (ms)
@@ -189,6 +196,10 @@ float node_v_max = D.node_v_max;
 
 float cal_vin_gain  = D.cal_vin_gain,  cal_vin_off  = D.cal_vin_off;
 float cal_vfan_gain = D.cal_vfan_gain, cal_vfan_off = D.cal_vfan_off;
+// VIN smoothing parameters
+uint32_t vin_samples     = D.vin_samples;
+float    vin_alpha_fast  = D.vin_alpha_fast;
+float    vin_alpha_slow  = D.vin_alpha_slow;
 // test_v removed
 
 // -------- SLEEP (vin + temp based) ----------
@@ -220,6 +231,7 @@ String sleep_state = "awake";      // exported JSON state (awake|arming)
 // -------- LIVE VARS ----------
 float vin_now=0, vfan_model=0, vfan_meas=0, dutyB_now=0;
 float vin_raw=0, vfan_raw=0; // pre-filter instantaneous averages
+static float vin_slow=0; // slow-filtered VIN for multi-scale smoothing
 // Floor model instrumentation
 static float vfloor_pred=0;      // predicted vnode at current floor (VB=0) using model
 static float vnode_residual=0;   // vfan_meas - vfan_model (model error)
@@ -228,6 +240,10 @@ static const float VNODE_BIAS_ALPHA = 0.02f; // time constant for bias estimate
 float temp_hot=0;       // hottest DS18B20 (used for control)
 float temp_other=NAN;   // the other (display only)
 int   ds_count=0;
+// Persistent maximum readings (persist across reboots, manually reset only)
+float max_temp_hot = -999.0f;   // maximum temperature recorded
+float max_vin = -999.0f;        // maximum VIN voltage recorded  
+float max_vfan_meas = -999.0f;  // maximum fan node voltage recorded
 // VIN diagnostics
 static float vin_min_obs=10.0f, vin_max_obs=-10.0f, vin_last_avg=0; static unsigned long vin_obs_start=0;
 static float vin_baseline=0.0f; // long-term (~10s) running average
@@ -397,6 +413,7 @@ static float applyPwmFrequencySafe(float req, bool verbose){
       pwm_freq_hz = attempt; pwm_freq_last_ok = attempt;
       ledcWrite(PWM_CH_A,toDutyCounts(floor_pct));
       ledcWrite(PWM_CH_B,toDutyCounts(dutyB_now));
+      if(verbose) { LOG_INFO(LOGC_PWR, "PWM applied %.1f Hz (A=%.1f B=%.1f)%s", attempt, aF, bF, (attempt!=req)?" (clamped/fallback)":""); }
       if(verbose && Serial) Serial.printf("[PWM] Applied %.1f Hz (A=%.1f B=%.1f)%s\n", attempt, aF, bF, (attempt!=req)?" (clamped/fallback)":"");
       return attempt;
     }
@@ -408,6 +425,7 @@ static float applyPwmFrequencySafe(float req, bool verbose){
   ledcSetup(PWM_CH_B, pwm_freq_last_ok, PWM_RES_BITS);
   ledcWrite(PWM_CH_A,toDutyCounts(floor_pct));
   ledcWrite(PWM_CH_B,toDutyCounts(dutyB_now));
+  if(verbose) { LOG_WARN(LOGC_PWR, "PWM FAIL: Could not apply requested freq. Reverting to %.1f Hz", pwm_freq_last_ok); }
   if(verbose && Serial) Serial.printf("[PWM][FAIL] Could not apply requested freq. Reverting to %.1f Hz\n", pwm_freq_last_ok);
   pwm_freq_hz = pwm_freq_last_ok;
   return pwm_freq_hz;
@@ -477,14 +495,20 @@ void updateControl(){
       float band_high= vin_baseline * (1.0f + VIN_CLAMP_FRAC);
       float band_width = band_high - band_low; if(band_width < VIN_MIN_BAND_V){ float mid = vin_baseline; band_low = mid - VIN_MIN_BAND_V*0.5f; band_high = mid + VIN_MIN_BAND_V*0.5f; if(band_low<0) band_low=0; }
       float vin_avg = vin_avg_raw; if(vin_avg < band_low) vin_avg = band_low; else if(vin_avg > band_high) vin_avg = band_high;
-      vin_raw = vin_avg; const float ALPHA_VIN = 0.20f; vin_now = (vin_now==0?vin_avg:(vin_now + ALPHA_VIN*(vin_avg - vin_now)));
+      vin_raw = vin_avg; 
+      // Dual-stage exponential filtering: fast response + slow smoothing (legacy mode)
+      float alpha_fast = vin_alpha_fast * 0.8f; // slightly slower than robust mode
+      float alpha_slow = vin_alpha_slow * 0.8f; 
+      float vin_fast = (vin_now==0?vin_avg:(vin_now + alpha_fast*(vin_avg - vin_now)));
+      vin_slow = (vin_slow==0?vin_avg:(vin_slow + alpha_slow*(vin_avg - vin_slow)));
+      vin_now = (vin_fast + vin_slow) * 0.5f;
       if(!vin_obs_start) vin_obs_start=millis(); if(millis()-vin_obs_start>1000){ if(vin_avg<vin_min_obs) vin_min_obs=vin_avg; if(vin_avg>vin_max_obs) vin_max_obs=vin_avg; }
       vin_last_avg = vin_avg; static unsigned long _lastVinDbg=0; unsigned long _nowDbg=millis();
   // Removed periodic LEG VIN-DBG telemetry (was verbose). Keep timing placeholder if future hook needed.
   // if(_nowDbg - _lastVinDbg > 6000){ _lastVinDbg=_nowDbg; }
     } else {
       // Robust filter: median + adaptive trimmed mean + guarded baseline & asymmetric clamp
-      const int N=21; int mv[N]; vin_total_raw=N; vin_rail_lo_ct=0; vin_rail_hi_ct=0;
+      const int N_MAX=51; int N = constrain((int)vin_samples, 15, N_MAX); int mv[N_MAX]; vin_total_raw=N; vin_rail_lo_ct=0; vin_rail_hi_ct=0;
       for(int i=0;i<N;i++){ int v=analogReadMilliVolts(PIN_PS4_IN); mv[i]=v; if(v<30) vin_rail_lo_ct++; else if(v>3200) vin_rail_hi_ct++; }
       // sort (simple insertion for small N)
       for(int i=1;i<N;i++){ int key=mv[i]; int j=i-1; while(j>=0 && mv[j]>key){ mv[j+1]=mv[j]; j--; } mv[j+1]=key; }
@@ -530,7 +554,14 @@ void updateControl(){
       float band_width = band_high - band_low; if(band_width < VIN_MIN_BAND_V){ float mid=vin_baseline; band_low = mid - VIN_MIN_BAND_V*0.5f; band_high = mid + VIN_MIN_BAND_V*0.5f; if(band_low<0) band_low=0; }
       float vin_avg = vin_avg_raw; if(vin_avg < band_low) vin_avg = band_low; else if(vin_avg > band_high) vin_avg = band_high;
       vin_raw = vin_avg_raw; // expose unclamped raw (trimmed) for diagnostics
-      const float ALPHA_VIN = 0.30f; vin_now = (vin_now==0?vin_avg:(vin_now + ALPHA_VIN*(vin_avg - vin_now)));
+      // Variance-adaptive dual-stage exponential filtering: slower when noisy
+      float noise_factor = stddev_mv / 100.0f; // normalize noise level (100mV reference)
+      if(noise_factor > 2.0f) noise_factor = 2.0f; // cap at 2x
+      float alpha_fast = vin_alpha_fast / (1.0f + noise_factor * 0.5f); // reduce by up to 50% when noisy
+      float alpha_slow = vin_alpha_slow / (1.0f + noise_factor * 1.0f); // reduce by up to 100% when noisy  
+      float vin_fast = (vin_now==0?vin_avg:(vin_now + alpha_fast*(vin_avg - vin_now)));
+      vin_slow = (vin_slow==0?vin_avg:(vin_slow + alpha_slow*(vin_avg - vin_slow)));
+      vin_now = (vin_fast + vin_slow) * 0.5f; // blend fast and slow filters
       if(!vin_obs_start) vin_obs_start=millis(); if(millis()-vin_obs_start>1000){ if(vin_avg<vin_min_obs) vin_min_obs=vin_avg; if(vin_avg>vin_max_obs) vin_max_obs=vin_avg; }
       vin_last_avg = vin_avg;
       static unsigned long _lastVinDbg=0; unsigned long _nowDbg=millis();
@@ -555,7 +586,13 @@ void updateControl(){
   }
 
   // Failsafe: over temperature → full fan
-  if (tempValid(temp_hot) && temp_hot >= temp_fail) fan_fail = true;
+  static bool temp_fail_logged = false;
+  if (tempValid(temp_hot) && temp_hot >= temp_fail) {
+    if (!temp_fail_logged) { LOG_WARN(LOGC_ERR, "Temperature failsafe triggered: %.1fC >= %.1fC", temp_hot, temp_fail); temp_fail_logged = true; }
+    fan_fail = true;
+  } else {
+    if (temp_fail_logged) { LOG_INFO(LOGC_ERR, "Temperature failsafe cleared: %.1fC < %.1fC", temp_hot, temp_fail); temp_fail_logged = false; }
+  }
   if (fan_fail) lift_logical = 100.0f;
 
   // --- RAW PWM OVERRIDE (diagnostic) ---
@@ -594,6 +631,7 @@ void updateControl(){
 
 
   // --- Map logical lift (0..100) into physical PWM_B duty range that produces node_v_min..node_v_max ---
+  const float OVERSHOOT_HYST = 0.006f; // small margin to avoid chatter
   // Compute current VA from floor
   float VA = 3.3f*(floor_pct/100.0f);
 
@@ -671,15 +709,46 @@ void updateControl(){
     fan_now_pct = normL*100.0f;
   }
 
-  // Overshoot feedback clamp: if measured node already above max+margin, pull target down gradually
-  const float OVERSHOOT_HYST = 0.006f; // small margin to avoid chatter
+  // Overshoot feedback clamp: if measured node already above max+margin, pull target down aggressively
   if(vfan_meas > 0 && vfan_meas >= (node_v_max + OVERSHOOT_HYST)){
-    // Scale back proportionally to overshoot fraction
+    // More aggressive overshoot protection - especially for narrow windows
     float excess = vfan_meas - node_v_max;
     float spanV  = (node_v_max - node_v_min);
-    float scale  = 1.0f - clamp01(excess / (spanV>0?spanV:0.10f)); // up to 100% cut if huge overshoot
+    
+    // For narrow windows (< 0.15V span), use much more aggressive scaling
+    float scale;
+    if(spanV < 0.15f) {
+      // Narrow window: cut duty by 2x the overshoot percentage, minimum 50% cut
+      float overshoot_pct = excess / node_v_max;
+      scale = 1.0f - fmaxf(0.5f, overshoot_pct * 2.0f);
+    } else {
+      // Wide window: use original proportional scaling
+      scale = 1.0f - clamp01(excess / (spanV>0?spanV:0.10f));
+    }
+    
+    float old_target = dutyB_tgt_phys;
     dutyB_tgt_phys *= scale;
-    if(dutyB_tgt_phys < dutyB_min_phys) dutyB_tgt_phys = dutyB_min_phys; // don't invert ordering
+    if(dutyB_tgt_phys < dutyB_min_phys) dutyB_tgt_phys = dutyB_min_phys;
+    LOG_WARN(LOGC_PWR, "overshoot vfan=%.3f > max=%.3f (span=%.3f), scaling duty %.1f%% -> %.1f%% (scale=%.2f)", 
+             vfan_meas, node_v_max, spanV, old_target, dutyB_tgt_phys, scale);
+  }
+  
+  // Emergency brake: if voltage is way over limit (>20% above max), force duty to minimum
+  if(vfan_meas > 0 && vfan_meas > node_v_max * 1.2f) {
+    float old_target = dutyB_tgt_phys;
+    dutyB_tgt_phys = dutyB_min_phys;
+    LOG_ERROR(LOGC_PWR, "EMERGENCY BRAKE: vfan=%.3f >> max=%.3f, forcing duty %.1f%% -> %.1f%%", 
+              vfan_meas, node_v_max, old_target, dutyB_tgt_phys);
+  }
+  
+  // Debug logging for voltage window issues
+  static unsigned long last_window_debug = 0;
+  if(millis() - last_window_debug > 2000) {
+    if(node_v_max < 1.1f && vfan_meas > node_v_max + 0.02f) {
+      LOG_WARN(LOGC_PWR, "node limit debug: vfan_meas=%.3f node_v_max=%.3f cal_valid=%d bypass=%d duty_range=%.1f-%.1f%%", 
+               vfan_meas, node_v_max, cal_valid, window_bypass, dutyB_min_phys, dutyB_max_phys);
+      last_window_debug = millis();
+    }
   }
 
   // Slew limit (50 ms loop) on PHYSICAL duty
@@ -687,6 +756,12 @@ void updateControl(){
   static bool firstLoop=true;               // guard for initial write
   float delta = dutyB_tgt_phys - dutyB;
   float step  = (50.0f / attack_ms);        // % per tick
+  
+  // Reduce slew rate when in overshoot to prevent runaway
+  if(vfan_meas > 0 && vfan_meas > node_v_max + OVERSHOOT_HYST) {
+    step *= 0.3f; // Much slower changes when overshooting
+  }
+  
   if      (delta >  step) dutyB += step;
   else if (delta < -step) dutyB -= step;
   else                    dutyB  = dutyB_tgt_phys;
@@ -732,33 +807,9 @@ void updateControl(){
   vnode_residual = vfan_meas - vfan_model; vnode_bias_ema = (vnode_bias_ema==0? vnode_residual : (vnode_bias_ema + VNODE_BIAS_ALPHA*(vnode_residual - vnode_bias_ema)));
   }
 
-  // Sleep probe suppression: if we just woke from timer and conditions to remain awake are NOT met, hold fan off
-  bool skip_rest_control=false;
-  if(slp_probe_active && !raw_override && ac_state==AC_IDLE){
-    bool vin_wake_ok = (vin_now >= slp_v);
-    bool temp_wake_ok = true;
-    if(slp_wake_tC_min > 0 && tempValid(temp_hot)) temp_wake_ok = (temp_hot >= slp_wake_tC_min);
-    bool stay_awake = false;
-    switch(slp_mode){
-      case 0: stay_awake = vin_wake_ok && temp_wake_ok; break; // VIN AND TEMP
-      case 1: stay_awake = vin_wake_ok; break;                 // VIN ONLY
-      case 2: stay_awake = temp_wake_ok; break;                // TEMP ONLY
-      case 3: stay_awake = (vin_wake_ok || temp_wake_ok); break; // VIN OR TEMP
-    }
-    if(stay_awake){
-      slp_probe_active = false; // normal control resumes
-    } else {
-      // Suppress fan outputs to 0 (both channels) during probe; keep dutyB_now 0 for UI
-      ledcWrite(PWM_CH_A, toDutyCounts(0));
-      ledcWrite(PWM_CH_B, toDutyCounts(0));
-      dutyB_now = 0; fan_now_pct = 0; // logical representation
-      if(!slp_probe_logged){ LOG_INFO(LOGC_SLP, "probe suppress vin=%.3f temp=%.1f thr=%.3f wake_t=%.1f", vin_now, temp_hot, slp_v, slp_wake_tC_min); slp_probe_logged=true; }
-      // Mark to skip remainder of control math (but still run sleep evaluator at end)
-      skip_rest_control=true;
-    }
-  }
+  // (Old probe suppression removed - handled by new logic earlier)
   // -------- Auto-Calibration State Machine (overrides outputs while active) --------
-  if(!skip_rest_control && ac_state != AC_IDLE && ac_state != AC_DONE && ac_state != AC_ERROR){
+  if(ac_state != AC_IDLE && ac_state != AC_DONE && ac_state != AC_ERROR){
     alpha_adapt_enabled = false; // freeze adaptation during active calibration
     unsigned long now = millis();
     // Adaptive settle: longer early, shorter as bracket narrows
@@ -779,6 +830,7 @@ void updateControl(){
         ledcWrite(PWM_CH_A, toDutyCounts(0));
         ledcWrite(PWM_CH_B, toDutyCounts(0));
         dutyB_now=0;
+        LOG_INFO(LOGC_CAL, "P1_SET discharge pre-baseline (prev floor=%.2f%%, extra=%lums)", floor_pct, ac_extra_settle_ms);
         if(Serial){ Serial.printf("[AutoCal] P1_SET discharge pre-baseline (prev floor=%.2f%%, extra=%lums)\n", floor_pct, ac_extra_settle_ms); }
         ac_target_min = node_v_min; ac_step_time=now; ac_state=AC_P1_WAIT; break; }
       case AC_P1_WAIT: {
@@ -883,9 +935,9 @@ void updateControl(){
   DBG_PRINT( Serial.printf("[AutoCal] state=%d floor_mid=%.2f lift_mid=%.2f v=%.3f itF=%d itL=%d\n", (int)ac_state, ac_floor_mid, ac_lift_mid, ac_last_v, ac_iter_floor, ac_iter_lift) );
         lastLogged=ac_state; lastLogMs=millis();
       }
-  if(ac_state==AC_VALIDATE){ Serial.printf("[AutoCal] VALIDATE hold floor=%.2f dutyB=%.2f ref=%.3f\n", floor_pct, cal_dutyB_max, ac_validate_ref_v); }
-  if(ac_state==AC_DONE){ Serial.printf("[AutoCal] DONE floor=%.2f dutyB_max=%.2f\n", floor_pct, cal_dutyB_max); }
-      if(ac_state==AC_ERROR){ Serial.printf("[AutoCal] ERROR %s\n", ac_error_msg.c_str()); }
+  if(ac_state==AC_VALIDATE){ LOG_INFO(LOGC_CAL, "VALIDATE hold floor=%.2f dutyB=%.2f ref=%.3f", floor_pct, cal_dutyB_max, ac_validate_ref_v); Serial.printf("[AutoCal] VALIDATE hold floor=%.2f dutyB=%.2f ref=%.3f\n", floor_pct, cal_dutyB_max, ac_validate_ref_v); }
+  if(ac_state==AC_DONE){ LOG_INFO(LOGC_CAL, "DONE floor=%.2f dutyB_max=%.2f", floor_pct, cal_dutyB_max); Serial.printf("[AutoCal] DONE floor=%.2f dutyB_max=%.2f\n", floor_pct, cal_dutyB_max); }
+      if(ac_state==AC_ERROR){ LOG_ERROR(LOGC_CAL, "ERROR %s", ac_error_msg.c_str()); Serial.printf("[AutoCal] ERROR %s\n", ac_error_msg.c_str()); }
     }
     // Timeout / error
     if( (ac_state==AC_P1_EVAL && ac_iter_floor>=AC_MAX_ITER+2) || (ac_state==AC_P2_EVAL && ac_iter_lift>=AC_MAX_ITER+2) ){
@@ -902,7 +954,7 @@ void updateControl(){
       ledcWrite(PWM_CH_B, toDutyCounts(ac_lift_mid));
       dutyB_now = ac_lift_mid; return; }
     // If done or error we fall through to normal mapping using results (if any)
-  } else if(!skip_rest_control) {
+  } else {
     // Calibration inactive: if it just finished, evaluate results and unfreeze adaptation
     if(!alpha_adapt_enabled){ alpha_adapt_enabled=true; }
     // Floor guard after phase1: if calibration completed but floor too low vs target
@@ -923,19 +975,149 @@ void updateControl(){
   }
 
   // Alpha adaptation gating: disable if suspect compression or near saturation
-  if(!skip_rest_control && alpha_adapt_enabled){
+  if(alpha_adapt_enabled){
     bool nearFull = (cal_valid && cal_dutyB_max > FULL_LIFT_WARN_THRESH && dutyB_now > (cal_dutyB_max - 1.0f));
     bool suspectCompression = (win_comp_low && cal_baseline_meas>0 && cal_baseline_meas < node_v_min - BASELINE_RECHECK_MARGIN);
     if(nearFull || suspectCompression){ alpha_adapt_enabled=false; }
   }
 
+  // Update persistent maximum readings
+  static bool max_values_changed = false;
+  if (tempValid(temp_hot) && temp_hot > max_temp_hot) {
+    max_temp_hot = temp_hot;
+    max_values_changed = true;
+  }
+  if (vin_now > max_vin) {
+    max_vin = vin_now;
+    max_values_changed = true;
+  }
+  if (vfan_meas > max_vfan_meas) {
+    max_vfan_meas = vfan_meas;
+    max_values_changed = true;
+  }
+  
+  // Save max values to preferences when changed (with throttling)
+  static unsigned long lastMaxSave = 0;
+  if (max_values_changed && (millis() - lastMaxSave > 5000)) { // Save at most every 5 seconds
+    prefs.begin("fan", false);
+    prefs.putFloat("max_temp", max_temp_hot);
+    prefs.putFloat("max_vin", max_vin);
+    prefs.putFloat("max_vfan", max_vfan_meas);
+    prefs.end();
+    max_values_changed = false;
+    lastMaxSave = millis();
+  }
+
   // Log every second
   static unsigned long lastLog=0;
-  if (!skip_rest_control && millis()-lastLog >= 1000){
+  if (millis()-lastLog >= 1000){
     history[hist_head] = { millis()/1000, temp_hot, temp_other, vin_now, vfan_model, vfan_meas, dutyB_now };
     hist_head = (hist_head+1) % HISTORY_LEN;
     if (hist_count < HISTORY_LEN) hist_count++;
     lastLog = millis();
+  }
+
+  // ---- Extended Sleep condition evaluation (revised semantics w/ slp_mode) ----
+  // slp_mode semantics for wake_criteria determination:
+  //   0 VIN_AND_TEMP: both VIN >= slp_v and temp >= slp_wake_tC_min (if >0)
+  //   1 VIN_ONLY: VIN condition only
+  //   2 TEMP_ONLY: Temperature condition only
+  //   3 VIN_OR_TEMP: either VIN or temperature
+  if(slp_en && (millis() > SLP_BOOT_GRACE_MS) && !raw_override && ac_state==AC_IDLE && !fan_fail){
+    unsigned long now_ms = millis();
+    bool safety_temp_ok = tempValid(temp_hot) ? (temp_hot < slp_tC_max) : false;
+    bool vin_high = vin_now >= slp_v;
+    bool temp_wake_ok = tempValid(temp_hot) && (slp_wake_tC_min <= 0 || temp_hot >= slp_wake_tC_min);
+    // Wake criteria: used ONLY for min-awake enforcement after deep sleep wake
+    bool wake_criteria=false;
+    switch(slp_mode){
+      case 0: wake_criteria = vin_high && temp_wake_ok; break; // AND
+      case 1: wake_criteria = vin_high; break;                // VIN only
+      case 2: wake_criteria = temp_wake_ok; break;            // TEMP only
+      case 3: wake_criteria = vin_high || temp_wake_ok; break;// OR
+      default: wake_criteria = vin_high; break;
+    }
+    // Sleep arming criteria: should NOT include wake temp check, only safety temp
+    bool can_sleep_vin = (vin_now > 0 && vin_now < slp_v);
+    bool can_sleep_temp = safety_temp_ok; // just safety limit, not wake temp
+    if(!safety_temp_ok){
+      if(slp_pending || slp_sample_count>0){ slp_pending=false; slp_armed=false; slp_cond_start_ms=0; slp_sample_count=0; }
+      sleep_state="awake";
+    } else if((now_ms - slp_last_wake_ms < slp_min_awake_ms) && wake_criteria){
+      // Minimum awake only enforced if wake criteria truly satisfied (prevents lingering if still below)
+      if(slp_pending || slp_sample_count>0){ slp_pending=false; slp_armed=false; slp_cond_start_ms=0; slp_sample_count=0; }
+      sleep_state="awake";
+    } else {
+      // Sleep arming logic: based on sleep conditions, not wake conditions
+      bool allow_arming = false;
+      switch(slp_mode){
+        case 0: // VIN_AND_TEMP: sleep when VIN low AND safety temp OK (ignore wake temp for arming)
+        case 1: // VIN_ONLY: sleep when VIN low
+          allow_arming = can_sleep_vin && can_sleep_temp; break;
+        case 2: // TEMP_ONLY: sleep when temp conditions allow (both safety OK and below wake threshold)
+          allow_arming = can_sleep_temp && !temp_wake_ok; break;
+        case 3: // VIN_OR_TEMP: sleep when either VIN allows OR temp allows
+          allow_arming = (can_sleep_vin && can_sleep_temp) || (can_sleep_temp && !temp_wake_ok); break;
+      }
+      if(allow_arming){
+        if(!slp_pending){
+          if(slp_sample_count < 250) slp_sample_count++;
+          if(slp_sample_count >= slp_arm_samples){
+            slp_pending=true; slp_armed=true; slp_cond_start_ms=now_ms; sleep_state="arming";
+            LOG_INFO(LOGC_SLP, "Armed for sleep (samples=%u/%u vin=%.3f temp=%.1f mode=%u)", slp_sample_count, slp_arm_samples, vin_now, temp_hot, (unsigned)slp_mode);
+            if(Serial){ Serial.printf("[SLEEP] Armed for sleep (samples=%u/%u vin=%.3f temp=%.1f mode=%u)\n", slp_sample_count, slp_arm_samples, vin_now, temp_hot, (unsigned)slp_mode); }
+          } else {
+            sleep_state="arming";
+            static unsigned long lastDbg=0; if(millis()-lastDbg>2000){ LOG_DEBUG(LOGC_SLP, "Arming %u/%u (vin=%.3f<%.3f temp=%.1f mode=%u)", slp_sample_count, slp_arm_samples, vin_now, slp_v, temp_hot, (unsigned)slp_mode); Serial.printf("[SLEEP] Arming %u/%u (vin=%.3f<%.3f temp=%.1f mode=%u)\n", slp_sample_count, slp_arm_samples, vin_now, slp_v, temp_hot, (unsigned)slp_mode); lastDbg=millis(); }
+          }
+        } else {
+          // dwell phase
+          bool rebound=false;
+          if(slp_mode==0 || slp_mode==1){
+            // Require VIN remain below threshold + hyst
+            rebound = vin_now >= slp_v + slp_v_hyst;
+          } else if(slp_mode==3){
+            // OR mode: rebound if either VIN rises above threshold OR temp crosses wake threshold
+            rebound = wake_criteria; // since wake_criteria for OR means either condition is high
+          } else if(slp_mode==2){
+            // TEMP only mode: rebound if temp_wake_ok becomes true
+            rebound = temp_wake_ok;
+          }
+          if(rebound){
+            slp_pending=false; slp_armed=false; slp_cond_start_ms=0; slp_sample_count=0; sleep_state="awake";
+          } else {
+            unsigned long dwell = now_ms - slp_cond_start_ms;
+            if(dwell >= slp_t_ms){
+              LOG_INFO(LOGC_SLP, "Entering deep sleep (mode=%u vin=%.3f temp=%.1f dwell=%lums)", (unsigned)slp_mode, vin_now, temp_hot, (unsigned long)slp_t_ms);
+              if(Serial){ Serial.printf("[SLEEP] Entering deep sleep (mode=%u vin=%.3f thr=%.3f temp=%.1f tC_max=%.1f dwell=%lums wakeInt=%lums hyst=%.3f)\n", (unsigned)slp_mode, vin_now, slp_v, temp_hot, slp_tC_max, (unsigned long)slp_t_ms, (unsigned long)slp_w_ms, slp_v_hyst); }
+              LOG_INFO(LOGC_SLP, "enter m=%u vin=%.3f temp=%.1f wInt=%lu dwell=%lu hyst=%.3f", (unsigned)slp_mode, vin_now, temp_hot, (unsigned long)slp_w_ms, (unsigned long)slp_t_ms, slp_v_hyst);
+              ledcDetachPin(PWM_CH_A); ledcDetachPin(PWM_CH_B);
+              pinMode(PIN_PWM_A, OUTPUT); pinMode(PIN_PWM_B, OUTPUT);
+              digitalWrite(PIN_PWM_A, LOW); digitalWrite(PIN_PWM_B, LOW);
+              gpio_hold_en((gpio_num_t)PIN_PWM_A); gpio_hold_en((gpio_num_t)PIN_PWM_B); gpio_deep_sleep_hold_en();
+              WiFi.mode(WIFI_OFF);
+              esp_sleep_enable_timer_wakeup( (uint64_t)slp_w_ms * 1000ULL );
+              Serial.flush(); delay(20);
+              slp_last_wake_ms = now_ms;
+              esp_deep_sleep_start();
+            } else {
+              sleep_state="arming";
+            }
+          }
+        }
+      } else {
+        // not allowed to arm; reset any partial state
+        if(slp_pending || slp_sample_count>0){ 
+          LOG_DEBUG(LOGC_SLP, "Arming blocked - wake_criteria=%d allow_arming=%d (vin=%.3f>=%.3f temp=%.1f>=%.1f mode=%u)", wake_criteria?1:0, allow_arming?1:0, vin_now, slp_v, temp_hot, slp_wake_tC_min, (unsigned)slp_mode);
+          if(Serial){ Serial.printf("[SLEEP] Arming blocked - wake_criteria=%d allow_arming=%d (vin=%.3f>=%.3f temp=%.1f>=%.1f mode=%u)\n", wake_criteria?1:0, allow_arming?1:0, vin_now, slp_v, temp_hot, slp_wake_tC_min, (unsigned)slp_mode); }
+          slp_pending=false; slp_armed=false; slp_cond_start_ms=0; slp_sample_count=0; 
+        }
+        sleep_state="awake";
+      }
+    }
+  } else {
+    if(slp_pending || slp_sample_count>0){ slp_pending=false; slp_armed=false; slp_cond_start_ms=0; slp_sample_count=0; }
+    if(sleep_state!="sleep") sleep_state="awake";
   }
 
 }
@@ -990,12 +1172,16 @@ String htmlPage(){
   h+="<tr><td>Fan Node (model)</td><td><span id='vfan'>?</span> V</td><td>Resistor network prediction</td></tr>";
   h+="<tr><td>Fan Node (meas)</td><td><span id='vfanm'>?</span> V</td><td>ADC feedback</td></tr>";
   h+="<tr><td>Lift PWM</td><td><span id='dutyB'>?</span> %</td><td>After slew limiting</td></tr>";
+  h+="<tr><td>Fan Speed</td><td><span id='fanSpeed'>?</span> %</td><td>Based on fan node voltage window</td></tr>";
   h+="<tr><td>Duty Window</td><td><span id='dutyRange'>?–?</span> %</td><td>Physical PWM_B range for 0–100 logical</td></tr>";
   h+="<tr><td>Win Flags</td><td><span id='winFlags'>?</span></td><td>compL/compH/inval/autoFloor</td></tr>";
   h+="<tr><td>AutoCal</td><td><span id='acStatus'>—</span></td><td>floor / lift calibration</td></tr>";
   h+="<tr><td>Temp HOT</td><td><span id='temp0'>?</span> °C</td><td>Highest valid sensor</td></tr>";
   h+="<tr><td>Temp OTHER</td><td><span id='temp1'>—</span> °C</td><td>Second sensor (if any)</td></tr>";
   h+="<tr><td>Sensors</td><td><span id='dscount'>0</span></td><td>Detected DS18B20 count</td></tr>";
+  h+="<tr style='border-top:1px solid #ddd'><td><strong>Max Temp</strong></td><td><span id='maxTemp'>?</span> °C</td><td>Peak temperature recorded</td></tr>";
+  h+="<tr><td><strong>Max VIN</strong></td><td><span id='maxVin'>?</span> V</td><td>Peak input voltage recorded</td></tr>";
+  h+="<tr><td><strong>Max Fan Node</strong></td><td><span id='maxVfan'>?</span> V</td><td>Peak fan node voltage recorded</td></tr>";
   h+="<tr><td>Mode</td><td><span id='mode'>?</span></td><td>Temp or PS4 mapping</td></tr>";
   h+="<tr><td>Fail State</td><td><span id='fail'>?</span></td><td>YES=Failsafe full fan</td></tr>";
   h+="</table>";
@@ -1008,14 +1194,14 @@ String htmlPage(){
   h+="<div class='control-group' data-for='vin_min_v'>";
   h+="<button class='lock-btn' id='toggle_vin_min_v' onclick=\"toggleEdit('vin_min_v')\">Edit</button>";
   h+="<label for='vin_min_v'>Vin Min (V):</label>";
-  h+="<input disabled type='range' id='vin_min_v' class='slider' min='0.50' max='1.00' step='0.001' value='"+String(vin_min_v,3)+"' oninput='updateDisplay(\"vin_min_v\", this.value, 3); applyVinConstraints();'>";
+  h+="<input disabled type='range' id='vin_min_v' class='slider' min='0.000' max='3.300' step='0.001' value='"+String(vin_min_v,3)+"' oninput='updateDisplay(\"vin_min_v\", this.value, 3); applyVinConstraints();'>";
   h+="<span class='value-display' id='vin_min_v_val'>"+String(vin_min_v,3)+"</span>";
   h+="<button disabled class='reset-btn' id='reset_vin_min_v' onclick=\"resetParam('vin_min_v')\">↺</button>";
   h+="</div>";
   h+="<div class='control-group'>";
   h+="<button class='lock-btn' id='toggle_vin_max_v' onclick=\"toggleEdit('vin_max_v')\">Edit</button>";
   h+="<label for='vin_max_v'>Vin Max (V):</label>";
-  h+="<input disabled type='range' id='vin_max_v' class='slider' min='0.70' max='1.20' step='0.001' value='"+String(vin_max_v,3)+"' oninput='updateDisplay(\"vin_max_v\", this.value, 3); applyVinConstraints();'>";
+  h+="<input disabled type='range' id='vin_max_v' class='slider' min='0.000' max='3.300' step='0.001' value='"+String(vin_max_v,3)+"' oninput='updateDisplay(\"vin_max_v\", this.value, 3); applyVinConstraints();'>";
   h+="<span class='value-display' id='vin_max_v_val'>"+String(vin_max_v,3)+"</span>";
   h+="<button disabled class='reset-btn' id='reset_vin_max_v' onclick=\"resetParam('vin_max_v')\">↺</button>";
   h+="</div>";
@@ -1112,6 +1298,31 @@ String htmlPage(){
   h+="</div>";
 
   h+="<div class='section'>";
+  h+="<h3>VIN Smoothing Parameters</h3>";
+  h+="<div class='control-group'>";
+  h+="<button class='lock-btn' id='toggle_vin_samples' onclick=\"toggleEdit('vin_samples')\">Edit</button>";
+  h+="<label for='vin_samples'>ADC Samples:</label>";
+  h+="<input disabled type='range' id='vin_samples' class='slider' min='15' max='51' step='2' value='"+String(vin_samples)+"' oninput='updateDisplay(\"vin_samples\", this.value, 0);'>";
+  h+="<span class='value-display' id='vin_samples_val'>"+String(vin_samples)+"</span>";
+  h+="<button disabled class='reset-btn' id='reset_vin_samples' onclick=\"resetParam('vin_samples')\">↺</button>";
+  h+="</div>";
+  h+="<div class='control-group'>";
+  h+="<button class='lock-btn' id='toggle_vin_alpha_fast' onclick=\"toggleEdit('vin_alpha_fast')\">Edit</button>";
+  h+="<label for='vin_alpha_fast'>Fast Alpha:</label>";
+  h+="<input disabled type='range' id='vin_alpha_fast' class='slider' min='0.02' max='0.50' step='0.01' value='"+String(vin_alpha_fast,3)+"' oninput='updateDisplay(\"vin_alpha_fast\", this.value, 3);'>";
+  h+="<span class='value-display' id='vin_alpha_fast_val'>"+String(vin_alpha_fast,3)+"</span>";
+  h+="<button disabled class='reset-btn' id='reset_vin_alpha_fast' onclick=\"resetParam('vin_alpha_fast')\">↺</button>";
+  h+="</div>";
+  h+="<div class='control-group'>";
+  h+="<button class='lock-btn' id='toggle_vin_alpha_slow' onclick=\"toggleEdit('vin_alpha_slow')\">Edit</button>";
+  h+="<label for='vin_alpha_slow'>Slow Alpha:</label>";
+  h+="<input disabled type='range' id='vin_alpha_slow' class='slider' min='0.005' max='0.20' step='0.005' value='"+String(vin_alpha_slow,3)+"' oninput='updateDisplay(\"vin_alpha_slow\", this.value, 3);'>";
+  h+="<span class='value-display' id='vin_alpha_slow_val'>"+String(vin_alpha_slow,3)+"</span>";
+  h+="<button disabled class='reset-btn' id='reset_vin_alpha_slow' onclick=\"resetParam('vin_alpha_slow')\">↺</button>";
+  h+="</div>";
+  h+="</div>";
+
+  h+="<div class='section'>";
 
   h+="<h3>Temperature Curve (°C → %)</h3>";
   for(int i=0;i<5;i++){
@@ -1131,7 +1342,12 @@ String htmlPage(){
   h+="<button class='btn' onclick='saveSettings()'>Save All Settings</button>";
   h+="<button class='btn secondary' onclick='resetAllSettings()'>Reset to Defaults</button>";
   h+="<button class='btn danger' onclick='factoryReset()'>Factory Wipe & Reboot</button>";
+  h+="<button class='btn secondary' onclick='rebootOnly()'>Reboot Only</button>";
   h+="<button class='btn help-btn' onclick='openHelp()'>Help</button>";
+  h+="<br><br><strong>Reset Max Readings:</strong><br>";
+  h+="<button class='btn secondary' onclick='resetMaxTemp()'>Reset Max Temp</button>";
+  h+="<button class='btn secondary' onclick='resetMaxVin()'>Reset Max VIN</button>";
+  h+="<button class='btn secondary' onclick='resetMaxVfan()'>Reset Max Fan Node</button>";
   h+="</div>";
 
   // Sleep settings section (new)
@@ -1160,7 +1376,8 @@ String htmlPage(){
   h+=" <button class='btn small' id='logClearBtn'>Clear</button>";
   h+=" <button class='btn small' id='logPauseBtn'>Pause</button>";
   h+="</div><pre id='logView' style='height:180px;overflow:auto;background:#111;color:#0f0;padding:6px;font-size:11px;line-height:1.25em;border:1px solid #333'></pre></div>";
-  h+="<div id='charts'><canvas id='cTemp'></canvas><canvas id='cFan'></canvas><canvas id='cVfan'></canvas></div>";
+  h+="<div style='margin:10px 0;text-align:center'><button class='btn secondary' onclick='resetGraphs()'>Reset Graphs</button></div>";
+  h+="<div id='charts'><canvas id='cTemp'></canvas><canvas id='cVin'></canvas><canvas id='cVfan'></canvas></div>";
   h+="<p><a href='/history' target='_blank'>Open history JSON</a></p>";
   h+="</div>"; // close container
 
@@ -1203,33 +1420,38 @@ String htmlPage(){
   h+="// Load defaults early\n";
   h+="xhrJSON('/defaults',function(err,d){if(!err && d && d.defaults){defaults=d.defaults;}});";
   // Correct loadConfigToUI (previous stray JS removed)
-  h+="function loadConfigToUI(cfg){try{if(window.console)console.log('Config received',cfg);}catch(e){}var info={vin_min_v:3,vin_max_v:3,lift_span:1,floor_pct:1,fan_max:1,attack_ms:0,temp_fail:0,cal_vin_off:3,cal_vin_gain:3,cal_vfan_off:3,cal_vfan_gain:3,slp_v:3,slp_v_hyst:3};var curveKeys={};for(var i=0;i<5;i++){curveKeys['t'+i]=true;curveKeys['f'+i]=true;}var allZero=true;for(var i=0;i<5;i++){if(cfg.hasOwnProperty('t'+i)&&parseFloat(cfg['t'+i])!==0){allZero=false;break;}}if(allZero){if(window.console)console.warn('Curve all zero - using defaults');for(var i=0;i<5;i++){if(defaults.hasOwnProperty('t'+i)){cfg['t'+i]=defaults['t'+i];cfg['f'+i]=defaults['f'+i];}}}for(var k in cfg){if(!cfg.hasOwnProperty(k)||curveKeys[k])continue;var el=$(k);if(el){if(k==='slp_en'){el.checked = (cfg[k]==1||cfg[k]==='1'||cfg[k]===true);continue;}if(k==='slp_mode'){el.value=cfg[k];continue;}var dec=info.hasOwnProperty(k)?info[k]:(k.indexOf('gain')>-1||k.indexOf('off')>-1?3: (k.indexOf('_ms')>-1?0:1));el.value=cfg[k];updateDisplay(k,cfg[k],dec);}}for(var i=0;i<5;i++){var tk='t'+i,fk='f'+i;var tEl=$(tk),fEl=$(fk);if(tEl&&cfg.hasOwnProperty(tk))tEl.value=cfg[tk];if(fEl&&cfg.hasOwnProperty(fk))fEl.value=cfg[fk];}setupVinConstraints();}";
+  h+="function loadConfigToUI(cfg){try{if(window.console)console.log('Config received',cfg);}catch(e){}var info={vin_min_v:3,vin_max_v:3,lift_span:1,floor_pct:1,fan_max:1,attack_ms:0,temp_fail:0,cal_vin_off:3,cal_vin_gain:3,cal_vfan_off:3,cal_vfan_gain:3,vin_samples:0,vin_alpha_fast:3,vin_alpha_slow:3,slp_v:3,slp_v_hyst:3};var curveKeys={};for(var i=0;i<5;i++){curveKeys['t'+i]=true;curveKeys['f'+i]=true;}var allZero=true;for(var i=0;i<5;i++){if(cfg.hasOwnProperty('t'+i)&&parseFloat(cfg['t'+i])!==0){allZero=false;break;}}if(allZero){if(window.console)console.warn('Curve all zero - using defaults');for(var i=0;i<5;i++){if(defaults.hasOwnProperty('t'+i)){cfg['t'+i]=defaults['t'+i];cfg['f'+i]=defaults['f'+i];}}}for(var k in cfg){if(!cfg.hasOwnProperty(k)||curveKeys[k])continue;var el=$(k);if(el){if(k==='slp_en'){el.checked = (cfg[k]==1||cfg[k]==='1'||cfg[k]===true);continue;}if(k==='slp_mode'){el.value=cfg[k];continue;}var dec=info.hasOwnProperty(k)?info[k]:(k.indexOf('gain')>-1||k.indexOf('off')>-1?3: (k.indexOf('_ms')>-1?0:1));el.value=cfg[k];updateDisplay(k,cfg[k],dec);}}for(var i=0;i<5;i++){var tk='t'+i,fk='f'+i;var tEl=$(tk),fEl=$(fk);if(tEl&&cfg.hasOwnProperty(tk))tEl.value=cfg[tk];if(fEl&&cfg.hasOwnProperty(fk))fEl.value=cfg[fk];}setupVinConstraints();}";
   h+="var __cfgTries=0;";
-  h+="function refresh(){xhrJSON('/json',function(err,data){var er=$('jsonErr');if(er){er.textContent=err?'JSON err':'';}if(err||!data)return;var vinEl=$('vin');if(!vinEl)return; $('vin').textContent=data.vin.toFixed(3);$('vfan').textContent=data.vfan.toFixed(3);$('vfanm').textContent=data.vfanm.toFixed(3);$('dutyB').textContent=data.dutyB.toFixed(1);if(data.dutyB_min!=null&&data.dutyB_max!=null){$('dutyRange').textContent=data.dutyB_min.toFixed(1)+'–'+data.dutyB_max.toFixed(1);}var flags='';if(data.win_comp_low)flags+='L';if(data.win_comp_high)flags+='H';if(data.win_invalid)flags+='!';if(data.floor_auto)flags+=(flags?' ':'')+'F';$('winFlags').textContent=flags||'—';var acMap={0:'idle',1:'floor set',2:'floor wait',3:'floor eval',4:'lift set',5:'lift wait',6:'lift eval',7:'done', '-1':'error'};var ac=acMap[data.ac_state]||data.ac_state; if(data.ac_valid) ac+=' ✓';$('acStatus').textContent=ac+(data.ac_duty_max>=0?(' max='+data.ac_duty_max.toFixed(1)+'%'):'');$('temp0').textContent=(data.temp0!=null)?data.temp0.toFixed(1):'—';$('temp1').textContent=(data.temp1!=null)?data.temp1.toFixed(1):'—';$('dscount').textContent=data.dscount;$('mode').textContent=data.mode?'Temp':'PS4';$('fail').textContent=data.fail?'YES':'no';if(data.config && !configLoaded){var defaultsReady=false;for(var k in defaults){if(defaults.hasOwnProperty(k)){defaultsReady=true;break;}}var allZero=true;for(var i=0;i<5;i++){var tk='t'+i; if(!data.config.hasOwnProperty(tk)){allZero=false;break;} if(parseFloat(data.config[tk])!==0){allZero=false;break;}}if((!data.curve_ok && allZero) || !defaultsReady){ if(__cfgTries<6){ if(window.console)console.warn('Deferring config apply (try '+__cfgTries+') curve_ok='+data.curve_ok+' allZero='+allZero+' defaultsReady='+defaultsReady); __cfgTries++; setTimeout(refresh,250); return; } else { if(window.console)console.warn('Applying config after max retries; using whatever values present'); } } loadConfigToUI(data.config); configLoaded=true;}});}";
-  h+="function setupSliderListeners(){var sliders=[[\"vin_min_v\",3],[\"vin_max_v\",3],[\"lift_span\",1],[\"floor_pct\",1],[\"fan_max\",1],[\"attack_ms\",0],[\"temp_fail\",0],[\"node_v_min\",3],[\"node_v_max\",3],[\"cal_vin_off\",3],[\"cal_vin_gain\",3],[\"cal_vfan_off\",3],[\"cal_vfan_gain\",3]];";
+  h+="function refresh(){xhrJSON('/json',function(err,data){var er=$('jsonErr');if(er){er.textContent=err?'JSON err':'';}if(err||!data)return;var vinEl=$('vin');if(!vinEl)return; $('vin').textContent=data.vin.toFixed(3);$('vfan').textContent=data.vfan.toFixed(3);$('vfanm').textContent=data.vfanm.toFixed(3);$('dutyB').textContent=data.dutyB.toFixed(1);$('fanSpeed').textContent=data.fanSpeed.toFixed(1);if(data.dutyB_min!=null&&data.dutyB_max!=null){$('dutyRange').textContent=data.dutyB_min.toFixed(1)+'–'+data.dutyB_max.toFixed(1);}var flags='';if(data.win_comp_low)flags+='L';if(data.win_comp_high)flags+='H';if(data.win_invalid)flags+='!';if(data.floor_auto)flags+=(flags?' ':'')+'F';$('winFlags').textContent=flags||'—';var acMap={0:'idle',1:'floor set',2:'floor wait',3:'floor eval',4:'lift set',5:'lift wait',6:'lift eval',7:'done', '-1':'error'};var ac=acMap[data.ac_state]||data.ac_state; if(data.ac_valid) ac+=' ✓';$('acStatus').textContent=ac+(data.ac_duty_max>=0?(' max='+data.ac_duty_max.toFixed(1)+'%'):'');$('temp0').textContent=(data.temp0!=null)?data.temp0.toFixed(1):'—';$('temp1').textContent=(data.temp1!=null)?data.temp1.toFixed(1):'—';$('dscount').textContent=data.dscount;$('maxTemp').textContent=data.maxTemp.toFixed(1);$('maxVin').textContent=data.maxVin.toFixed(3);$('maxVfan').textContent=data.maxVfan.toFixed(3);$('mode').textContent=data.mode?'Temp':'PS4';$('fail').textContent=data.fail?'YES':'no';if(data.config && !configLoaded){var defaultsReady=false;for(var k in defaults){if(defaults.hasOwnProperty(k)){defaultsReady=true;break;}}var allZero=true;for(var i=0;i<5;i++){var tk='t'+i; if(!data.config.hasOwnProperty(tk)){allZero=false;break;} if(parseFloat(data.config[tk])!==0){allZero=false;break;}}if((!data.curve_ok && allZero) || !defaultsReady){ if(__cfgTries<6){ if(window.console)console.warn('Deferring config apply (try '+__cfgTries+') curve_ok='+data.curve_ok+' allZero='+allZero+' defaultsReady='+defaultsReady); __cfgTries++; setTimeout(refresh,250); return; } else { if(window.console)console.warn('Applying config after max retries; using whatever values present'); } } loadConfigToUI(data.config); configLoaded=true;}});}";
+  h+="function setupSliderListeners(){var sliders=[[\"vin_min_v\",3],[\"vin_max_v\",3],[\"lift_span\",1],[\"floor_pct\",1],[\"fan_max\",1],[\"attack_ms\",0],[\"temp_fail\",0],[\"node_v_min\",3],[\"node_v_max\",3],[\"cal_vin_off\",3],[\"cal_vin_gain\",3],[\"cal_vfan_off\",3],[\"cal_vfan_gain\",3],[\"vin_samples\",0],[\"vin_alpha_fast\",3],[\"vin_alpha_slow\",3]];";
   h+="for(var i=0;i<sliders.length;i++){var id=sliders[i][0],dec=sliders[i][1];var s=$(id);if(!s)continue;(function(id,dec,s){function handler(){updateDisplay(id,s.value,dec);if(id==='vin_min_v'||id==='vin_max_v')applyVinConstraints();}s.addEventListener('input',handler);s.addEventListener('change',handler);handler();})(id,dec,s);}";
   h+="if(!window.__mirror){window.__mirror=setInterval(function(){for(var i=0;i<sliders.length;i++){var id=sliders[i][0],dec=sliders[i][1];var s=$(id);if(s)updateDisplay(id,s.value,dec);}},700);} }";
   h+="function toggleEdit(id){var s=$(id);var r=$('reset_'+id);var b=$('toggle_'+id);if(!s||!b)return;var isDisabled=s.hasAttribute('disabled');if(isDisabled){s.removeAttribute('disabled');if(r)r.removeAttribute('disabled');b.classList.add('active');b.textContent='Lock';}else{s.setAttribute('disabled','disabled');if(r)r.setAttribute('disabled','disabled');b.classList.remove('active');b.textContent='Edit';}}";
   h+="function openHelp(){var o=$('helpOverlay');if(o)o.style.display='flex';window.scrollTo(0,0);}";
   h+="function closeHelp(){var o=$('helpOverlay');if(o)o.style.display='none';}";
   h+="function setupVinConstraints(){var a=$('vin_min_v'),b=$('vin_max_v');if(a&&b)applyVinConstraints();}";
-  h+="function applyVinConstraints(){var a=$('vin_min_v'),b=$('vin_max_v');if(!a||!b)return;var vmin=parseFloat(a.value)||0.600;var vmax=parseFloat(b.value)||1.000;if(vmax<=vmin+0.010){vmax=vmin+0.020;b.value=vmax.toFixed(3);updateDisplay('vin_max_v',vmax,3);}b.min=(vmin+0.010).toFixed(3);a.max=(vmax-0.010).toFixed(3);}";
-  h+="function saveSettings(){var ids=['vin_min_v','vin_max_v','lift_span','floor_pct','fan_max','attack_ms','temp_fail','node_v_min','node_v_max','cal_vin_off','cal_vin_gain','cal_vfan_off','cal_vfan_gain','slp_v','slp_tC_max','slp_wake_tC_min','slp_t_ms','slp_w_ms','slp_v_hyst','slp_arm_samples','slp_min_awake_ms','slp_mode'];var q='';for(var i=0;i<ids.length;i++){var e=$(ids[i]);if(!e)continue;var v=(ids[i]=='slp_en')?(e.checked?1:0):e.value;q+=encodeURIComponent(ids[i])+'='+encodeURIComponent(v)+'&';}var slpEn=$('slp_en');if(slpEn)q+='slp_en='+(slpEn.checked?1:0)+'&';for(var i=0;i<5;i++){var t=$('t'+i),f=$('f'+i);if(t)q+='t'+i+'='+encodeURIComponent(t.value)+'&';if(f)q+='f'+i+'='+encodeURIComponent(f.value)+'&';}if(q.length>0)q=q.substring(0,q.length-1);xhrText('/set?'+q,function(err){if(err)alert('Save failed');else alert('Settings saved');});}";
-  h+="function resetParam(key){if(!defaults.hasOwnProperty(key))return;var e=$(key);if(!e)return;if(key==='slp_en'){e.checked=(defaults[key]==1||defaults[key]===true);return;}var info={'vin_min_v':3,'vin_max_v':3,'lift_span':1,'floor_pct':1,'fan_max':1,'attack_ms':0,'temp_fail':0,'node_v_min':3,'node_v_max':3,'cal_vin_off':3,'cal_vin_gain':3,'cal_vfan_off':3,'cal_vfan_gain':3,'slp_v':3,'slp_v_hyst':3,'slp_wake_tC_min':1};e.value=defaults[key];var dec=info.hasOwnProperty(key)?info[key]:(key.indexOf('_ms')>-1?0:1);updateDisplay(key,defaults[key],dec);if(key==='vin_min_v'||key==='vin_max_v')applyVinConstraints();}";
+  h+="function applyVinConstraints(){var a=$('vin_min_v'),b=$('vin_max_v');if(!a||!b)return;var vmin=parseFloat(a.value)||0.000;var vmax=parseFloat(b.value)||3.300;if(vmax<=vmin+0.010){vmax=vmin+0.020;if(vmax>3.300)vmax=3.300;b.value=vmax.toFixed(3);updateDisplay('vin_max_v',vmax,3);}var minForMax=Math.max(0.000,(vmin+0.010));var maxForMin=Math.min(3.300,(vmax-0.010));b.min=minForMax.toFixed(3);a.max=maxForMin.toFixed(3);}";
+  h+="function saveSettings(){var ids=['vin_min_v','vin_max_v','lift_span','floor_pct','fan_max','attack_ms','temp_fail','node_v_min','node_v_max','cal_vin_off','cal_vin_gain','cal_vfan_off','cal_vfan_gain','vin_samples','vin_alpha_fast','vin_alpha_slow','slp_v','slp_tC_max','slp_wake_tC_min','slp_t_ms','slp_w_ms','slp_v_hyst','slp_arm_samples','slp_min_awake_ms','slp_mode'];var q='';for(var i=0;i<ids.length;i++){var e=$(ids[i]);if(!e)continue;var v=(ids[i]=='slp_en')?(e.checked?1:0):e.value;q+=encodeURIComponent(ids[i])+'='+encodeURIComponent(v)+'&';}var slpEn=$('slp_en');if(slpEn)q+='slp_en='+(slpEn.checked?1:0)+'&';for(var i=0;i<5;i++){var t=$('t'+i),f=$('f'+i);if(t)q+='t'+i+'='+encodeURIComponent(t.value)+'&';if(f)q+='f'+i+'='+encodeURIComponent(f.value)+'&';}if(q.length>0)q=q.substring(0,q.length-1);xhrText('/set?'+q,function(err){if(err)alert('Save failed');else alert('Settings saved');});}";
+  h+="function resetParam(key){if(!defaults.hasOwnProperty(key))return;var e=$(key);if(!e)return;if(key==='slp_en'){e.checked=(defaults[key]==1||defaults[key]===true);return;}var info={'vin_min_v':3,'vin_max_v':3,'lift_span':1,'floor_pct':1,'fan_max':1,'attack_ms':0,'temp_fail':0,'node_v_min':3,'node_v_max':3,'cal_vin_off':3,'cal_vin_gain':3,'cal_vfan_off':3,'cal_vfan_gain':3,'vin_samples':0,'vin_alpha_fast':3,'vin_alpha_slow':3,'slp_v':3,'slp_v_hyst':3,'slp_wake_tC_min':1};e.value=defaults[key];var dec=info.hasOwnProperty(key)?info[key]:(key.indexOf('_ms')>-1?0:1);updateDisplay(key,defaults[key],dec);if(key==='vin_min_v'||key==='vin_max_v')applyVinConstraints();}";
   h+="function resetTempPoint(i){var tk='t'+i,fk='f'+i;if(defaults.hasOwnProperty(tk))$('t'+i).value=defaults[tk];if(defaults.hasOwnProperty(fk))$('f'+i).value=defaults[fk];}";
   h+="function resetAllSettings(){var k;for(k in defaults){if(!defaults.hasOwnProperty(k))continue;var e=$(k);if(e){e.value=defaults[k];updateDisplay(k,defaults[k],3);}}setupVinConstraints();saveSettings();}";
   h+="function toggleMode(){xhrText('/toggle',function(){});}";
   h+="function factoryReset(){if(!confirm('Erase and reboot?'))return;xhrText('/factory',function(){alert('Rebooting...');setTimeout(function(){location.reload();},1500);});}";
+  h+="function resetGraphs(){if(!confirm('Clear chart history?'))return;xhrText('/resetgraphs',function(){alert('Graphs reset!');setTimeout(renderCharts,500);});}";
+  h+="function rebootOnly(){if(!confirm('Reboot without erasing settings?'))return;xhrText('/reboot',function(){alert('Rebooting...');setTimeout(function(){location.reload();},2000);});}";
+  h+="function resetMaxTemp(){if(!confirm('Reset maximum temperature reading?'))return;xhrText('/resetmaxtemp',function(){alert('Max temperature reset!');});}";
+  h+="function resetMaxVin(){if(!confirm('Reset maximum VIN voltage reading?'))return;xhrText('/resetmaxvin',function(){alert('Max VIN reset!');});}";
+  h+="function resetMaxVfan(){if(!confirm('Reset maximum fan node voltage reading?'))return;xhrText('/resetmaxvfan',function(){alert('Max fan node reset!');});}";
   h+="function startAutoCal(){xhrText('/autocal',function(err,res){if(err){alert('AutoCal error: '+err);return;}alert('AutoCal start: '+res);});}";
   h+="function drawChart(c,xs,ys,col,yMin,yMax,yl,stats){var ctx=c.getContext('2d');var W=c.width=c.clientWidth,H=c.height=c.clientHeight;ctx.clearRect(0,0,W,H);ctx.fillStyle='#fff';ctx.fillRect(0,0,W,H);var L=50,R=8,T=18,B=22,w=W-L-R,h=H-T-B;ctx.strokeStyle='#eee';ctx.lineWidth=1;ctx.beginPath();for(var g=0;g<=4;g++){var y=T+h*g/4;ctx.moveTo(L,y);ctx.lineTo(W-R,y);}ctx.stroke();ctx.fillStyle='#444';ctx.font='11px sans-serif';for(var g=0;g<=4;g++){var val=yMax-(yMax-yMin)*g/4;var y=T+h*g/4+4;ctx.fillText(val.toFixed( (Math.abs(yMax-yMin)<5)?2:1 ),5,y);}ctx.strokeStyle='#222';ctx.beginPath();ctx.moveTo(L,T);ctx.lineTo(L,H-B);ctx.lineTo(W-R,H-B);ctx.stroke();ctx.fillStyle='#000';ctx.font='12px sans-serif';ctx.fillText(yl,5,T-6);if(xs.length<2)return;var x0=xs[0],x1=xs[xs.length-1];function X(x){return L+(x-x0)/( (x1-x0)||1 )*w;}function Y(y){return T+(1-(y-yMin)/( (yMax-yMin)||1 ))*h;}ctx.strokeStyle=col;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(X(xs[0]),Y(ys[0]));for(var i=1;i<xs.length;i++)ctx.lineTo(X(xs[i]),Y(ys[i]));ctx.stroke();if(stats){ctx.fillStyle='rgba(0,0,0,0.65)';ctx.font='10px monospace';var txt='min '+stats.min.toFixed(stats.dp)+'  max '+stats.max.toFixed(stats.dp)+'  cur '+stats.cur.toFixed(stats.dp)+'  avg '+stats.avg.toFixed(stats.dp);var tw=ctx.measureText(txt).width+8;var th=14;ctx.fillRect(W-tw-4,T+2,tw,th);ctx.fillStyle='#fff';ctx.fillText(txt,W-tw, T+12);} }";
-  h+="function arrMin(a,def){if(a.length==0)return def;var m=a[0];for(var i=1;i<a.length;i++)if(a[i]<m)m=a[i];return Math.min(m,def);}function arrMax(a,def){if(a.length==0)return def;var m=a[0];for(var i=1;i<a.length;i++)if(a[i]>m)m=a[i];return Math.max(m,def);}";
+  h+="function autoScale(a,defMin,defMax){if(a.length==0)return {min:defMin,max:defMax};var min=a[0],max=a[0];for(var i=1;i<a.length;i++){if(a[i]<min)min=a[i];if(a[i]>max)max=a[i];}var span=max-min;if(span<0.001){min=defMin;max=defMax;span=max-min;}var pad=span*0.1;min=Math.max(min-pad,0);max=max+pad;if(max-min<0.01){var mid=(min+max)/2;min=mid-0.005;max=mid+0.005;}return {min:min,max:max};}";
   h+="function statObj(a){var n=a.length;var mn=a[0],mx=a[0],sum=0;for(var i=0;i<n;i++){var v=a[i];if(v<mn)mn=v;if(v>mx)mx=v;sum+=v;}return {min:mn,max:mx,cur:a[n-1],avg:sum/n,dp:(Math.abs(mx-mn)<5?2:1)};}";
-  h+="function renderCharts(){xhrJSON('/history',function(err,a){if(err||!a||a.length<2)return;var xs=[],temps=[],duty=[],vfm=[];for(var i=0;i<a.length;i++){xs.push(a[i].t);temps.push(a[i].thot);duty.push(a[i].duty);vfm.push(a[i].vfanm);}var tmin=arrMin(temps,30),tmax=arrMax(temps,90);drawChart(document.getElementById('cTemp'),xs,temps,'#c00',tmin,tmax,'°C',statObj(temps));drawChart(document.getElementById('cFan'),xs,duty,'#06c',0,100,'Lift %',statObj(duty));var vmin=arrMin(vfm,0.8),vmax=arrMax(vfm,1.3);drawChart(document.getElementById('cVfan'),xs,vfm,'#090',vmin,vmax,'Vfan',statObj(vfm));});}";
+  h+="function renderCharts(){xhrJSON('/history',function(err,a){if(err||!a||a.length<2)return;var xs=[],temps=[],vin=[],vfm=[];for(var i=0;i<a.length;i++){xs.push(a[i].t);temps.push(a[i].thot);vin.push(a[i].vin);vfm.push(a[i].vfanm);}var tScale=autoScale(temps,20,80);drawChart(document.getElementById('cTemp'),xs,temps,'#c00',tScale.min,tScale.max,'°C',statObj(temps));var vinScale=autoScale(vin,0.0,3.3);drawChart(document.getElementById('cVin'),xs,vin,'#06c',vinScale.min,vinScale.max,'VIN',statObj(vin));var vfmScale=autoScale(vfm,0.8,1.5);drawChart(document.getElementById('cVfan'),xs,vfm,'#090',vfmScale.min,vfmScale.max,'Vfan',statObj(vfm));});}";
   h+="function initializeUI(){setupSliderListeners();refresh();setInterval(refresh,1000);setInterval(renderCharts,2500);}";
   // ---- Log panel JS ----
   h+="var __logLast=0,__logPaused=false;";
   h+="function buildCatMask(){var c=document.querySelectorAll('.logCat');var m=0;for(var i=0;i<c.length;i++){if(c[i].checked){m|=(1<<parseInt(c[i].value));}}return m;}";
-  h+="function fetchLog(){if(__logPaused)return;var sev=parseInt(document.getElementById('logSev').value);var mask=buildCatMask();var url='/log?since='+__logLast+'&sev='+sev+'&cat='+mask.toString(16);xhrJSON(url,function(err,d){if(err||!d||!d.entries)return;var v=document.getElementById('logView');for(var i=0;i<d.entries.length;i++){var e=d.entries[i];__logLast=e.id;var line='['+e.id+'] '+e.t_ms+'ms C'+e.cat+' S'+e.sev+' '+e.msg;v.textContent+=line+'\\n';}if(d.entries.length>0){v.scrollTop=v.scrollHeight;} });}";
+  h+="function fetchLog(){if(__logPaused)return;var sev=parseInt(document.getElementById('logSev').value);var mask=buildCatMask();var url='/log?since='+__logLast+'&sev='+sev+'&cat='+mask.toString(16);xhrJSON(url,function(err,d){if(err||!d||!d.entries)return;var v=document.getElementById('logView');for(var i=0;i<d.entries.length;i++){var e=d.entries[i];__logLast=e.id;var line='['+e.id+'] '+e.t_s+'s C'+e.cat+' S'+e.sev+' '+e.msg;v.textContent+=line+'\\n';}if(d.entries.length>0){v.scrollTop=v.scrollHeight;} });}";
   h+="function setupLogUI(){var lc=document.getElementById('logClearBtn');if(lc)lc.onclick=function(){xhrJSON('/log?clear=1',function(){__logLast=0;document.getElementById('logView').textContent='';});};var pb=document.getElementById('logPauseBtn');if(pb)pb.onclick=function(){__logPaused=!__logPaused;pb.textContent=__logPaused?'Resume':'Pause';};var cats=document.querySelectorAll('.logCat');for(var i=0;i<cats.length;i++){cats[i].onchange=function(){__logLast=0;document.getElementById('logView').textContent='';};}document.getElementById('logSev').onchange=function(){__logLast=0;document.getElementById('logView').textContent='';};setInterval(fetchLog,1200);}";
   h+="document.addEventListener('DOMContentLoaded',setupLogUI);";
   h+="if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',initializeUI);}else{initializeUI();}";
@@ -1266,6 +1488,9 @@ void handleDefaults(){
   j+="\"cal_vin_gain\":"+String(D.cal_vin_gain,3)+",";
   j+="\"cal_vfan_off\":"+String(D.cal_vfan_off,3)+",";
   j+="\"cal_vfan_gain\":"+String(D.cal_vfan_gain,3)+",";
+  j+="\"vin_samples\":"+String(D.vin_samples)+",";
+  j+="\"vin_alpha_fast\":"+String(D.vin_alpha_fast,3)+",";
+  j+="\"vin_alpha_slow\":"+String(D.vin_alpha_slow,3)+",";
   j+="\"node_v_min\":"+String(D.node_v_min,3)+",";
   j+="\"node_v_max\":"+String(D.node_v_max,3);
   for(int i=0;i<5;i++){
@@ -1300,6 +1525,14 @@ void handleSet(){
   if(server.hasArg("cal_vin_gain")) cal_vin_gain= server.arg("cal_vin_gain").toFloat();
   if(server.hasArg("cal_vfan_off")) cal_vfan_off= server.arg("cal_vfan_off").toFloat();
   if(server.hasArg("cal_vfan_gain"))cal_vfan_gain=server.arg("cal_vfan_gain").toFloat();
+  // VIN smoothing parameters
+  uint32_t o_vin_samples = vin_samples; float o_vin_alpha_fast = vin_alpha_fast, o_vin_alpha_slow = vin_alpha_slow;
+  if(server.hasArg("vin_samples")){ uint32_t s = (uint32_t)server.arg("vin_samples").toInt(); if(s>=15 && s<=51) vin_samples = s; }
+  if(server.hasArg("vin_alpha_fast")) vin_alpha_fast = constrain(server.arg("vin_alpha_fast").toFloat(), 0.02f, 0.50f);
+  if(server.hasArg("vin_alpha_slow")) vin_alpha_slow = constrain(server.arg("vin_alpha_slow").toFloat(), 0.005f, 0.20f);
+  if(vin_samples != o_vin_samples || vin_alpha_fast != o_vin_alpha_fast || vin_alpha_slow != o_vin_alpha_slow) {
+    LOG_INFO(LOGC_SET, "VIN smoothing: samples=%u fast=%.3f slow=%.3f", vin_samples, vin_alpha_fast, vin_alpha_slow);
+  }
   // Sleep parameters
   // WiFi station credentials
   bool wifi_changed=false; bool haveWifiArg=false;
@@ -1365,8 +1598,8 @@ void handleSet(){
   }
 
   // sanitize and enforce range/gap
-  vin_min_v = sane(vin_min_v, 0.50f, 1.00f, D.vin_min_v);
-  vin_max_v = sane(vin_max_v, 0.70f, 1.20f, D.vin_max_v);
+  vin_min_v = sane(vin_min_v, 0.00f, 3.30f, D.vin_min_v);
+  vin_max_v = sane(vin_max_v, 0.00f, 3.30f, D.vin_max_v);
   // Ensure proper ordering with minimum gap
   if (vin_max_v <= vin_min_v) { 
     vin_max_v = vin_min_v + 0.05f;
@@ -1387,6 +1620,10 @@ void handleSet(){
 
   cal_vin_gain  = sane(cal_vin_gain,  0.80f, 1.20f, D.cal_vin_gain);
   cal_vfan_gain = sane(cal_vfan_gain, 0.80f, 1.20f, D.cal_vfan_gain);
+  // VIN smoothing sanitize
+  if(vin_samples < 15) vin_samples = 15; if(vin_samples > 51) vin_samples = 51;
+  vin_alpha_fast = sane(vin_alpha_fast, 0.02f, 0.50f, D.vin_alpha_fast);
+  vin_alpha_slow = sane(vin_alpha_slow, 0.005f, 0.20f, D.vin_alpha_slow);
   // Sleep sanitize
   slp_v = sane(slp_v, 0.00f, 1.20f, D.slp_v);
   slp_tC_max = sane(slp_tC_max, 5.0f, 90.0f, D.slp_tC_max);
@@ -1415,6 +1652,10 @@ void handleSet(){
   prefs.putFloat("cal_vin_gain", cal_vin_gain);
   prefs.putFloat("cal_vfan_off", cal_vfan_off);
   prefs.putFloat("cal_vfan_gain",cal_vfan_gain);
+  // VIN smoothing parameters
+  prefs.putUInt("vin_samples", vin_samples);
+  prefs.putFloat("vin_a_fast", vin_alpha_fast);
+  prefs.putFloat("vin_a_slow", vin_alpha_slow);
   prefs.putFloat("slp_v_hyst", slp_v_hyst);
   prefs.putUChar("slp_arm_samples", slp_arm_samples);
   prefs.putUInt("slp_min_aw", slp_min_awake_ms); // migrated short key
@@ -1534,6 +1775,13 @@ void handleJson(){
   j+="\"vfan\":"+String(vfan_model,3)+",";
   j+="\"vfanm\":"+String(vfan_meas,3)+",";
   j+="\"dutyB\":"+String(dutyB_now,1)+",";
+  // Calculate fan speed percentage based on node voltage window
+  float fan_speed_pct = 0.0f;
+  if (node_v_max > node_v_min && vfan_meas >= node_v_min) {
+    fan_speed_pct = ((vfan_meas - node_v_min) / (node_v_max - node_v_min)) * 100.0f;
+    if (fan_speed_pct > 100.0f) fan_speed_pct = 100.0f;
+  }
+  j+="\"fanSpeed\":"+String(fan_speed_pct,1)+",";
   j+="\"fan_now\":"+String(fan_now_pct,1)+","; // logical 0-100% from curve
   // Normalization diagnostics
   j+="\"dutyB_min\":"+String(dutyB_min_phys,1)+",";
@@ -1553,6 +1801,10 @@ void handleJson(){
   if (tempValid(temp_hot))   j+="\"temp0\":"+String(temp_hot,1)+","; else j+="\"temp0\":null,";
   if (tempValid(temp_other)) j+="\"temp1\":"+String(temp_other,1)+","; else j+="\"temp1\":null,";
   j+="\"dscount\":"+String(ds_count)+",";
+  // Persistent maximum readings
+  j+="\"maxTemp\":"+String(max_temp_hot,1)+",";
+  j+="\"maxVin\":"+String(max_vin,3)+",";
+  j+="\"maxVfan\":"+String(max_vfan_meas,3)+",";
   j+="\"mode\":" + String(use_temp_mode ? "true" : "false") + ",";
   j+="\"fail\":" + String(fan_fail ? "true" : "false") + ",";
   j+="\"win_impossible\":" + String(win_impossible?"true":"false") + ",";
@@ -1669,7 +1921,7 @@ void handleLog(){
       if(e.sev < sevMin) continue;
       if(catMask != 0xFFFFFFFFUL){ uint32_t bit = (1u << e.cat); if((catMask & bit)==0) continue; }
       if(emitted>0) j+=",";
-      j+="{\"id\":"+String(e.id)+",\"t_ms\":"+String(e.t_ms)+",\"cat\":"+String(e.cat)+",\"sev\":"+String(e.sev)+",\"msg\":\"";
+      j+="{\"id\":"+String(e.id)+",\"t_s\":"+String(e.t_ms / 1000.0f, 2)+",\"cat\":"+String(e.cat)+",\"sev\":"+String(e.sev)+",\"msg\":\"";
       // escape quotes/backslashes in msg
       for(const char *p=e.msg; *p; ++p){ char c=*p; if(c=='\\' || c=='\"') j+='\\'; if(c=='\n' || c=='\r') continue; j+=c; }
       j+="\"}";
@@ -1707,6 +1959,50 @@ void handleReboot(){
   ESP.restart();
 }
 
+void handleResetGraphs(){
+  // Clear chart history data
+  hist_count = 0;
+  hist_head = 0;
+  fast_hist_count = 0;
+  fast_hist_head = 0;
+  
+  server.send(200, "text/plain", "Graph history cleared");
+  if(Serial) Serial.println("[SYS] Graph history reset requested");
+}
+
+void handleResetMaxTemp(){
+  // Reset maximum temperature reading
+  max_temp_hot = -999.0f;
+  prefs.begin("fan", false);
+  prefs.putFloat("max_temp", max_temp_hot);
+  prefs.end();
+  
+  server.send(200, "text/plain", "Max temperature reset");
+  if(Serial) Serial.println("[SYS] Max temperature reset requested");
+}
+
+void handleResetMaxVin(){
+  // Reset maximum VIN voltage reading
+  max_vin = -999.0f;
+  prefs.begin("fan", false);
+  prefs.putFloat("max_vin", max_vin);
+  prefs.end();
+  
+  server.send(200, "text/plain", "Max VIN reset");
+  if(Serial) Serial.println("[SYS] Max VIN reset requested");
+}
+
+void handleResetMaxVfan(){
+  // Reset maximum fan node voltage reading
+  max_vfan_meas = -999.0f;
+  prefs.begin("fan", false);
+  prefs.putFloat("max_vfan", max_vfan_meas);
+  prefs.end();
+  
+  server.send(200, "text/plain", "Max fan node reset");
+  if(Serial) Serial.println("[SYS] Max fan node reset requested");
+}
+
 void handleAutoCal(){
   if(server.hasArg("stop")){
     if(ac_state!=AC_IDLE){ ac_state=AC_IDLE; server.send(200,"text/plain","Cancelled"); }
@@ -1719,9 +2015,11 @@ void handleAutoCal(){
   cal_valid=false; cal_dutyB_max=-1; ac_error_msg=""; ac_step_time=millis();
   if(cal_floor_lock){
     ac_state = AC_P2_SET; // skip floor search
+    LOG_INFO(LOGC_CAL, "START (floor-lock) floor=%.2f node_v=%.3f-%.3f dutyB=%.2f", floor_pct, node_v_min, node_v_max, dutyB_now);
     if(Serial){ Serial.printf("[AutoCal] START (floor-lock) floor=%.2f node_v_min=%.3f node_v_max=%.3f dutyB_now=%.2f\n", floor_pct, node_v_min, node_v_max, dutyB_now); }
   } else {
     ac_state = AC_P1_SET;
+    LOG_INFO(LOGC_CAL, "START node_v=%.3f-%.3f floor_start=%.2f dutyB=%.2f", node_v_min, node_v_max, floor_pct, dutyB_now);
     if(Serial){ Serial.printf("[AutoCal] START node_v_min=%.3f node_v_max=%.3f floor_start=%.2f dutyB_now=%.2f\n", node_v_min, node_v_max, floor_pct, dutyB_now); }
   }
   server.send(200,"text/plain","Started");
@@ -1799,6 +2097,10 @@ void setup(){
   cal_vin_gain = prefs.getFloat("cal_vin_gain", cal_vin_gain);
   cal_vfan_off = prefs.getFloat("cal_vfan_off", cal_vfan_off);
   cal_vfan_gain= prefs.getFloat("cal_vfan_gain",cal_vfan_gain);
+  // VIN smoothing parameters
+  vin_samples    = prefs.getUInt("vin_samples", vin_samples);
+  vin_alpha_fast = prefs.getFloat("vin_a_fast", vin_alpha_fast);
+  vin_alpha_slow = prefs.getFloat("vin_a_slow", vin_alpha_slow);
   for(int i=0;i<5;i++){
     temp_pt[i]=prefs.getFloat(("t"+String(i)).c_str(),temp_pt[i]);
     fan_pt[i]=prefs.getFloat(("f"+String(i)).c_str(),fan_pt[i]);
@@ -1808,6 +2110,10 @@ void setup(){
   v_bias        = prefs.getFloat("v_bias", v_bias);
   wA_eff        = prefs.getFloat("wA_eff", wA_eff);
   wB_eff        = prefs.getFloat("wB_eff", wB_eff);
+  // Load persistent max readings
+  max_temp_hot  = prefs.getFloat("max_temp", max_temp_hot);
+  max_vin       = prefs.getFloat("max_vin", max_vin);
+  max_vfan_meas = prefs.getFloat("max_vfan", max_vfan_meas);
   // Extended sleep params
   slp_v_hyst       = prefs.getFloat("slp_v_hyst", slp_v_hyst);
   slp_arm_samples  = prefs.getUChar("slp_arm_samples", slp_arm_samples);
@@ -1892,8 +2198,8 @@ void setup(){
   }
 
   // Sanitize & enforce small gap without hard reset
-  vin_min_v = sane(vin_min_v, 0.40f, 1.20f, D.vin_min_v);
-  vin_max_v = sane(vin_max_v, 0.40f, 1.20f, D.vin_max_v);
+  vin_min_v = sane(vin_min_v, 0.00f, 3.30f, D.vin_min_v);
+  vin_max_v = sane(vin_max_v, 0.00f, 3.30f, D.vin_max_v);
   if (vin_max_v <= vin_min_v + 0.01f) { vin_max_v = vin_min_v + 0.02f; }
 
   // Load WiFi credentials (after prefs.end above) in read-only reopen.
@@ -1922,6 +2228,10 @@ void setup(){
   server.on("/defaults",handleDefaults);
   server.on("/factory",handleFactory);
   server.on("/reboot",handleReboot);
+  server.on("/resetgraphs",handleResetGraphs);
+  server.on("/resetmaxtemp",handleResetMaxTemp);
+  server.on("/resetmaxvin",handleResetMaxVin);
+  server.on("/resetmaxvfan",handleResetMaxVfan);
   server.on("/autocal",handleAutoCal);
   server.begin();
   LOG_INFO(LOGC_NET, "http ready");
@@ -2313,8 +2623,8 @@ void loop(){
               key.trim(); valStr.trim();
               float val = valStr.toFloat();
               bool ok=true; // assume ok then sanitize
-              if(key=="vin_min_v"){ vin_min_v = sane(val,0.50f,1.00f,D.vin_min_v); }
-              else if(key=="vin_max_v"){ vin_max_v = sane(val,0.70f,1.20f,D.vin_max_v); }
+              if(key=="vin_min_v"){ vin_min_v = sane(val,0.00f,3.30f,D.vin_min_v); }
+              else if(key=="vin_max_v"){ vin_max_v = sane(val,0.00f,3.30f,D.vin_max_v); }
               else if(key=="floor_pct"){ floor_pct = sane(val,0.0f,60.0f,D.floor_pct); invalidateCal(); }
               else if(key=="lift_span"){ lift_span = sane(val,0.0f,60.0f,D.lift_span); }
               else if(key=="fan_max"){ fan_max = sane(val,10.0f,100.0f,D.fan_max); }
@@ -2438,6 +2748,39 @@ void loop(){
         if(boot_baseline_active && (millis() - boot_baseline_start) > 3000){
           Serial.println("[BOOT] Baseline capture timeout"); boot_baseline_active=false; boot_baseline_pending=false; }
       }
+    // --- Sleep probe PWM suppression ---
+    // Prevent ANY fan spin during timer probe wakes when wake criteria are not satisfied.
+    // This uses wake criteria (including wake temp) to determine if fans should run.
+    bool suppress_probe=false;
+    static bool probe_logged=false; // rate-limit logging
+    if(slp_en && !raw_override && ac_state==AC_IDLE && !fan_fail){
+      bool safety_temp_ok = tempValid(temp_hot) ? (temp_hot < slp_tC_max) : false;
+      if(safety_temp_ok){
+        bool vin_high = vin_now >= slp_v;
+        bool temp_wake_ok = tempValid(temp_hot) && (slp_wake_tC_min <= 0 || temp_hot >= slp_wake_tC_min);
+        bool wake_criteria=false;
+        switch(slp_mode){
+          case 0: wake_criteria = vin_high && temp_wake_ok; break; // AND
+          case 1: wake_criteria = vin_high; break;                // VIN only
+          case 2: wake_criteria = temp_wake_ok; break;            // TEMP only
+          case 3: wake_criteria = vin_high || temp_wake_ok; break;// OR
+          default: wake_criteria = vin_high; break;
+        }
+        if(!wake_criteria){ suppress_probe=true; }
+      }
+    }
+    if(suppress_probe){
+      // Force both PWM channels off immediately
+      ledcWrite(PWM_CH_A, 0);
+      ledcWrite(PWM_CH_B, 0);
+      dutyB_now = 0;
+      // Reset any auto-cal attempt side-effects (keep state machine idle)
+      if(!probe_logged){ LOG_INFO(LOGC_SLP, "probe-suppress vin=%.3f temp=%.1f", vin_now, temp_hot); probe_logged=true; }
+    } else {
+      if(probe_logged){ LOG_INFO(LOGC_SLP, "probe-resume vin=%.3f temp=%.1f", vin_now, temp_hot); }
+      probe_logged=false;
+    }
+    // Always run updateControl() so sleep evaluation can progress even during suppression
     updateControl();
     // Fast history capture (~100ms)
     unsigned long now_ms = millis();

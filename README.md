@@ -21,6 +21,9 @@ Convert the PlayStation 4 internal PWM fan control signal (~25 kHz on the origin
 - Persistence via NVS (ESP32 Preferences) with default recovery after factory wipe.
 - Extended sleep / low‑power system: VIN & temperature conditional deep sleep with selectable mode logic (AND/OR), hysteresis (`slp_v_hyst`), sample gating (`slp_arm_samples`), dwell timing, minimum awake guard (`slp_min_awake_ms`), optional wake temperature guard (`slp_wake_tC_min`), and periodic wake probe interval.
 - Structured event log ring buffer with `/log` endpoint + Web UI panel (incremental fetch, severity & category filters, clear & pause).
+- **Persistent maximum readings**: Track and display peak temperature, VIN voltage, and fan node voltage with individual reset controls.
+- **Enhanced web interface**: Auto-scaling charts, fan speed percentage display, improved VIN range controls (0-3.3V), reset graphs functionality.
+- **Home Assistant integration**: Comprehensive JSON API with all sensor data, status, and diagnostics for seamless HA integration.
  - WiFi STA-first with automatic fallback to built-in AP if configured network unavailable.
 
 ---
@@ -101,7 +104,8 @@ If FAN_CTRL > ~1.3 V at idle: lower `floor_pct` or clear a bad calibration. If t
 - `v_bias`, `wA_eff`, `wB_eff`, `learn_alpha`, `alpha_frozen`
 - Sleep: `slp_en`, `slp_v`, `slp_tC_max`, `slp_t_ms`, `slp_w_ms`
 - Extended Sleep Additions: `slp_v_hyst`, `slp_arm_samples`, `slp_min_awake_ms`, `slp_mode`
- - Wake Temp Guard: `slp_wake_tC_min`
+- Wake Temp Guard: `slp_wake_tC_min`
+- **Persistent Max Readings**: `max_temp`, `max_vin`, `max_vfan` (peak values that survive reboots)
 
 ---
 ## Web Endpoints
@@ -115,6 +119,10 @@ If FAN_CTRL > ~1.3 V at idle: lower `floor_pct` or clear a bad calibration. If t
 | `/defaults` | Reset runtime to defaults (not factory clear) |
 | `/factory` | Clear NVS + reboot |
 | `/reboot` | Soft reboot |
+| `/resetgraphs` | Clear chart history data |
+| `/resetmaxtemp` | Reset maximum temperature reading |
+| `/resetmaxvin` | Reset maximum VIN voltage reading |
+| `/resetmaxvfan` | Reset maximum fan node voltage reading |
 | `/autocal` | Start / stop AutoCal |
 | `/log` | Query event log (incremental fetch + filters, optional clear) |
 | (STA/AP) | Device serves same endpoints whether connected as station or fallback AP |
@@ -439,6 +447,185 @@ Re-run AutoCal/learn if |vnode_bias| persistently > ~0.015 V.
 ---
 ## Testing & Validation
 See `TESTING.md` for serial parser (CR/LF/CRLF) tests, VIN filter mode checks, and instrumentation examples.
+
+---
+## Home Assistant Integration
+
+The ESP32 provides comprehensive sensor data via the `/json` endpoint, making it perfect for Home Assistant integration.
+
+### Available Data
+The JSON API exposes all relevant sensor readings and system status:
+
+```json
+{
+  // Temperature Sensors
+  "temp0": 45.2,           // Primary temperature (°C)
+  "temp1": 42.1,           // Secondary temperature (°C) 
+  "dscount": 2,            // Number of DS18B20 sensors detected
+  
+  // Voltage Measurements  
+  "vin": 0.847,            // PS4 input voltage
+  "vfan": 1.234,           // Fan node voltage (model prediction)
+  "vfanm": 1.228,          // Fan node voltage (actual measurement)
+  
+  // Fan Control
+  "fanSpeed": 67.3,        // Fan speed percentage (0-100%)
+  "fan_now": 65.2,         // Logical fan percentage from curve
+  "dutyB": 72.1,           // PWM duty cycle percentage
+  
+  // Persistent Maximum Readings (NEW)
+  "maxTemp": 52.7,         // Peak temperature ever recorded
+  "maxVin": 1.045,         // Peak VIN voltage ever recorded  
+  "maxVfan": 1.456,        // Peak fan node voltage ever recorded
+  
+  // System Status
+  "fail": false,           // Failsafe state (boolean)
+  "mode": true,            // Temperature mode vs PS4 mode
+  "wifi_rssi": -45,        // WiFi signal strength
+  "wifi_ip": "192.168.8.113",
+  
+  // Additional Rich Data
+  "slp_en": true,          // Sleep mode enabled
+  "slp_pending": false,    // Sleep arming state
+  "ac_state": 0,           // Auto-calibration state
+  "ac_valid": true,        // Calibration validity
+  "model_learned": true,   // Adaptive model status
+  "raw_override": false    // Manual PWM override active
+}
+```
+
+### Home Assistant Configuration Example
+
+Add this to your `configuration.yaml`:
+
+```yaml
+# PS4 Fan Controller Integration
+sensor:
+  - platform: rest
+    resource: "http://192.168.8.113/json"  # Replace with your ESP32 IP
+    name: "PS4 Fan Controller"
+    json_attributes:
+      - temp0
+      - temp1
+      - fanSpeed
+      - vin
+      - vfan
+      - vfanm
+      - dutyB
+      - maxTemp
+      - maxVin
+      - maxVfan
+      - fail
+      - mode
+      - wifi_rssi
+      - dscount
+      - ac_valid
+      - model_learned
+      - slp_en
+      - slp_pending
+    value_template: "{{ value_json.temp0 }}"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    scan_interval: 30  # Update every 30 seconds
+
+  # Individual sensors for easier automation
+  - platform: template
+    sensors:
+      ps4_primary_temperature:
+        friendly_name: "PS4 Primary Temperature"
+        value_template: "{{ state_attr('sensor.ps4_fan_controller', 'temp0') }}"
+        unit_of_measurement: "°C"
+        device_class: temperature
+        
+      ps4_secondary_temperature:
+        friendly_name: "PS4 Secondary Temperature"
+        value_template: "{{ state_attr('sensor.ps4_fan_controller', 'temp1') }}"
+        unit_of_measurement: "°C"
+        device_class: temperature
+        
+      ps4_fan_speed:
+        friendly_name: "PS4 Fan Speed"
+        value_template: "{{ state_attr('sensor.ps4_fan_controller', 'fanSpeed') }}"
+        unit_of_measurement: "%"
+        icon: mdi:fan
+        
+      ps4_vin_voltage:
+        friendly_name: "PS4 Input Voltage"
+        value_template: "{{ state_attr('sensor.ps4_fan_controller', 'vin') }}"
+        unit_of_measurement: "V"
+        device_class: voltage
+        
+      ps4_max_temperature:
+        friendly_name: "PS4 Max Temperature (All Time)"
+        value_template: "{{ state_attr('sensor.ps4_fan_controller', 'maxTemp') }}"
+        unit_of_measurement: "°C"
+        device_class: temperature
+        icon: mdi:thermometer-alert
+        
+      ps4_max_vin:
+        friendly_name: "PS4 Max VIN (All Time)"
+        value_template: "{{ state_attr('sensor.ps4_fan_controller', 'maxVin') }}"
+        unit_of_measurement: "V"
+        device_class: voltage
+        icon: mdi:flash-alert
+        
+      ps4_wifi_signal:
+        friendly_name: "PS4 Fan Controller WiFi"
+        value_template: "{{ state_attr('sensor.ps4_fan_controller', 'wifi_rssi') }}"
+        unit_of_measurement: "dBm"
+        device_class: signal_strength
+
+binary_sensor:
+  - platform: template
+    sensors:
+      ps4_fan_failsafe:
+        friendly_name: "PS4 Fan Failsafe Active"
+        value_template: "{{ state_attr('sensor.ps4_fan_controller', 'fail') }}"
+        device_class: problem
+        icon: mdi:alert-circle
+        
+      ps4_temperature_mode:
+        friendly_name: "PS4 Temperature Mode"
+        value_template: "{{ state_attr('sensor.ps4_fan_controller', 'mode') }}"
+        icon: mdi:thermometer-lines
+        
+      ps4_sleep_pending:
+        friendly_name: "PS4 Sleep Pending"
+        value_template: "{{ state_attr('sensor.ps4_fan_controller', 'slp_pending') }}"
+        icon: mdi:sleep
+
+# Optional: Automation examples
+automation:
+  - alias: "PS4 High Temperature Alert"
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.ps4_primary_temperature
+        above: 70
+    action:
+      - service: notify.mobile_app_your_phone  # Replace with your notification service
+        data:
+          title: "PS4 Temperature Alert"
+          message: "PS4 temperature is {{ states('sensor.ps4_primary_temperature') }}°C"
+          
+  - alias: "PS4 Failsafe Activated"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.ps4_fan_failsafe
+        to: 'on'
+    action:
+      - service: notify.mobile_app_your_phone
+        data:
+          title: "PS4 Fan Failsafe Activated"
+          message: "PS4 fan controller has entered failsafe mode!"
+```
+
+### Historical Data
+For historical charts and long-term analysis, Home Assistant will automatically store sensor data. You can also query the ESP32's `/history` endpoint directly for time-series data.
+
+### Advanced Integration
+- **REST Commands**: Create HA services to trigger calibration, reset max values, or reboot the controller
+- **MQTT**: Consider adding MQTT publishing to the ESP32 firmware for real-time updates
+- **Custom Dashboard**: Build a Lovelace dashboard with temperature trends, fan curves, and system status
 
 ## Future / Roadmap
 - Bimodal VIN clustering refinement (further stabilization)
